@@ -27,7 +27,9 @@ export default function HomeClient({ user }: { user: User | null }) {
   const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
 
   return (
-    <div className={`page-atoms-bg min-h-screen w-full text-foreground transition-all duration-300 ${isSidebarPinned && user ? 'pl-64' : ''}`}>
+    <div
+      className={`page-atoms-bg min-h-screen w-full text-foreground transition-all duration-300 ${isSidebarPinned && user ? "pl-64" : ""}`}
+    >
       <SidebarAndHeader user={user} onSidebarChange={setIsSidebarPinned} />
 
       <main className="mx-auto flex w-full max-w-[1200px] flex-col items-center px-4 pb-14 pt-24 sm:px-6 sm:pt-32 lg:pt-36">

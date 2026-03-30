@@ -133,7 +133,7 @@ export default function LoginPage() {
                 onBlur={(event) => {
                   const value = event.target.value.trim();
                   setShowEmailFormatError(
-                    Boolean(value) && !EMAIL_REGEX.test(value)
+                    Boolean(value) && !EMAIL_REGEX.test(value),
                   );
                 }}
                 placeholder="输入您的电子邮件地址"
@@ -165,15 +165,15 @@ export default function LoginPage() {
             </div>
 
             {errorText ? (
-                <p className="text-center text-[13px] font-medium text-[#d04550]">
-                  {errorText}
-                </p>
-              ) : null}
+              <p className="text-center text-[13px] font-medium text-[#d04550]">
+                {errorText}
+              </p>
+            ) : null}
             {successText ? (
-                <p className="text-center text-[13px] font-medium text-[#27824f]">
-                  {successText}
-                </p>
-              ) : null}
+              <p className="text-center text-[13px] font-medium text-[#27824f]">
+                {successText}
+              </p>
+            ) : null}
 
             <button
               type="submit"

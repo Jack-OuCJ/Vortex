@@ -24,6 +24,6 @@ export async function createClient() {
           }
         },
       },
-    }
+    },
   );
 }

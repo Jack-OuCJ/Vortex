@@ -47,19 +47,25 @@ export async function POST(request: Request) {
   formData.append("secret", secretKey);
   formData.append("response", token);
 
-  const remoteIp = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const remoteIp = request.headers
+    .get("x-forwarded-for")
+    ?.split(",")[0]
+    ?.trim();
   if (remoteIp) {
     formData.append("remoteip", remoteIp);
   }
 
-  const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
+  const verifyResponse = await fetch(
+    "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: formData.toString(),
+      cache: "no-store",
     },
-    body: formData.toString(),
-    cache: "no-store",
-  });
+  );
 
   if (!verifyResponse.ok) {
     return NextResponse.json(
