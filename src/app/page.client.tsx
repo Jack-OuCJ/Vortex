@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Image from "next/image";
 import { motion } from "framer-motion";
 import { Plus, ArrowRight } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
@@ -13,18 +14,19 @@ type UserProfile = {
 };
 
 type AgentBadge = {
-  label: string;
-  bg: string;
+  src: string;
+  name: string;
+  role: string;
 };
 
 const AGENTS: AgentBadge[] = [
-  { label: "M", bg: "#ffb06f" },
-  { label: "S", bg: "#d2c7b4" },
-  { label: "E", bg: "#ff97b5" },
-  { label: "B", bg: "#9aa4bf" },
-  { label: "A", bg: "#7db6ff" },
-  { label: "D", bg: "#6acb88" },
-  { label: "I", bg: "#b586e6" },
+  { src: "/teams-avatar/Leader.png", name: "Emma", role: "团队领导" },
+  { src: "/teams-avatar/seo.png", name: "Sarah", role: "SEO专家" },
+  { src: "/teams-avatar/pm.png", name: "Liam", role: "产品经理" },
+  { src: "/teams-avatar/architect.png", name: "Bob", role: "架构师" },
+  { src: "/teams-avatar/50-engineer.png", name: "Alex", role: "工程师" },
+  { src: "/teams-avatar/data-analyst.png", name: "David", role: "技术分析师" },
+  { src: "/teams-avatar/deep-researcher.png", name: "Maya", role: "深度研究员" },
 ];
 
 export default function HomeClient({
@@ -58,17 +60,34 @@ export default function HomeClient({
           <div className="mb-5 flex items-center justify-center">
             {AGENTS.map((agent, index) => (
               <motion.div
-                key={agent.label}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ delay: 0.1 + index * 0.06, duration: 0.35 }}
-                style={{
-                  zIndex: AGENTS.length - index,
-                  backgroundColor: agent.bg,
+                key={agent.role}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                whileHover={{ scale: 1.2, zIndex: 10, y: -4 }}
+                transition={{
+                  delay: 0.1 + index * 0.06,
+                  duration: 0.35,
+                  scale: { duration: 0.2 },
                 }}
-                className="-ml-2 flex size-11 items-center justify-center rounded-full border-2 border-background text-sm font-semibold text-black/80 first:ml-0"
+                className="group relative -ml-3 flex size-12 cursor-pointer items-center justify-center overflow-visible rounded-full border-2 border-background bg-secondary transition-shadow hover:shadow-lg first:ml-0 sm:size-14"
+                style={{ zIndex: AGENTS.length - index }}
               >
-                {agent.label}
+                <div className="relative size-full overflow-hidden rounded-full">
+                  <Image
+                    src={agent.src}
+                    alt={`${agent.name} - ${agent.role}`}
+                    fill
+                    sizes="(max-width: 768px) 48px, 56px"
+                    className="object-cover"
+                    priority
+                  />
+                </div>
+                {/* Tooltip */}
+                <div className="pointer-events-none absolute -bottom-10 left-1/2 flex -translate-x-1/2 flex-col items-center whitespace-nowrap opacity-0 transition-all duration-200 group-hover:opacity-100">
+                  <div className="rounded-md bg-foreground px-2 py-1 text-xs font-medium text-background shadow-md">
+                    {agent.role} ({agent.name})
+                  </div>
+                </div>
               </motion.div>
             ))}
           </div>

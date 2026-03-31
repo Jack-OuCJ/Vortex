@@ -4,11 +4,6 @@ import { createClient } from "@/lib/supabase/server";
 const DEFAULT_AVATAR_URL =
   "https://rmjacyfbivgftfgxymbm.supabase.co/storage/v1/object/public/avatars/Gemini_Generated_Image_nishebnishebnish.png";
 
-function buildGoogleDefaultAvatarSvg(letter: string) {
-  const safeLetter = (letter || "A").toUpperCase();
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="128" fill="#000000"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-family="Arial, sans-serif" font-size="120" fill="#FFFFFF">${safeLetter}</text></svg>`;
-}
-
 function getGoogleDisplayName(user: {
   email?: string;
   user_metadata?: Record<string, unknown>;
@@ -25,6 +20,26 @@ function getGoogleDisplayName(user: {
   if (fullName) return fullName;
   if (name) return name;
   return user.email?.split("@")[0] ?? "Atoms_User";
+}
+
+function getGoogleAvatarUrl(user: { user_metadata?: Record<string, unknown> }) {
+  const avatarUrl =
+    typeof user.user_metadata?.avatar_url === "string"
+      ? user.user_metadata.avatar_url.trim()
+      : "";
+  const pictureUrl =
+    typeof user.user_metadata?.picture === "string"
+      ? user.user_metadata.picture.trim()
+      : "";
+
+  return avatarUrl || pictureUrl || null;
+}
+
+function isLegacyGeneratedGoogleAvatar(url: string) {
+  return (
+    url.includes("/storage/v1/object/public/avatars/") &&
+    url.endsWith("/google-default.svg")
+  );
 }
 
 export async function GET(request: Request) {
@@ -45,6 +60,8 @@ export async function GET(request: Request) {
         const provider = user.app_metadata?.provider;
         const displayName = getGoogleDisplayName(user);
         const profileEmail = user.email ?? null;
+        const googleAvatarUrl =
+          provider === "google" ? getGoogleAvatarUrl(user) : null;
 
         const { data: existingProfile } = await supabase
           .from("profiles")
@@ -52,27 +69,16 @@ export async function GET(request: Request) {
           .eq("id", user.id)
           .maybeSingle();
 
-        let avatarUrl = existingProfile?.avatar_url ?? DEFAULT_AVATAR_URL;
+        const existingAvatarUrl = existingProfile?.avatar_url?.trim() || null;
+        const shouldUseGoogleAvatar =
+          provider === "google" &&
+          (!existingAvatarUrl ||
+            existingAvatarUrl === DEFAULT_AVATAR_URL ||
+            isLegacyGeneratedGoogleAvatar(existingAvatarUrl));
 
-        if (provider === "google") {
-          const avatarPath = `${user.id}/google-default.svg`;
-          const initial = displayName[0] ?? "A";
-          const svgContent = buildGoogleDefaultAvatarSvg(initial);
-
-          const { error: uploadError } = await supabase.storage
-            .from("avatars")
-            .upload(avatarPath, svgContent, {
-              contentType: "image/svg+xml",
-              upsert: true,
-            });
-
-          if (!uploadError) {
-            const { data } = supabase.storage
-              .from("avatars")
-              .getPublicUrl(avatarPath);
-            avatarUrl = data.publicUrl;
-          }
-        }
+        const avatarUrl = shouldUseGoogleAvatar
+          ? googleAvatarUrl ?? existingAvatarUrl ?? DEFAULT_AVATAR_URL
+          : existingAvatarUrl ?? DEFAULT_AVATAR_URL;
 
         await supabase.from("profiles").upsert(
           {
