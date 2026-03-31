@@ -28,9 +28,13 @@ async function testLLM() {
     const response = await llm.invoke("你好，请简短地回复我。");
     console.log("\n✅ Response Received:");
     console.log(response.content);
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("\n❌ LLM Invocation Error:");
-    console.error(err.message);
+    if (err instanceof Error) {
+      console.error(err.message);
+    } else {
+      console.error(err);
+    }
   }
 }
 

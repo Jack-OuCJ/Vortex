@@ -34,3 +34,25 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## Supabase Schema Setup (No Migration)
+
+This project uses a manual SQL setup flow (no migration runner required).
+
+1. Open your Supabase project SQL Editor.
+2. Run the SQL in `supabase/schema.sql`.
+3. Confirm these tables exist:
+	- `public.projects`
+	- `public.project_files`
+	- `public.chat_sessions`
+	- `public.chat_messages`
+
+After this, the following APIs are ready to use:
+
+- `GET /api/projects`
+- `POST /api/projects`
+- `GET /api/projects/:id`
+- `PATCH /api/projects/:id`
+- `DELETE /api/projects/:id`
+- `GET /api/projects/:id/files`
+- `PUT /api/projects/:id/files`

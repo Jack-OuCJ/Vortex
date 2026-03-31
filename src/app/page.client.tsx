@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import Image from "next/image";
 import { motion } from "framer-motion";
 import { Plus, ArrowRight } from "lucide-react";

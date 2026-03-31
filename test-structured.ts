@@ -31,11 +31,17 @@ async function testStructuredOutput() {
     const result = await pmModel.invoke("你好");
     console.log("\n✅ Result:", result);
 
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("\n❌ Error invoking structured output:");
     console.error(err);
-    if (err.response) {
-      console.error(err.response.data);
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "response" in err &&
+      typeof (err as { response?: unknown }).response === "object"
+    ) {
+      const response = (err as { response?: { data?: unknown } }).response;
+      console.error(response?.data);
     }
   }
 }

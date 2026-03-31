@@ -54,6 +54,101 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 
 状态注入 (State Injection) 代替全量记忆： 在多轮迭代对话中，后端不携带冗长的废话历史，而是直接将当前沙箱的“最新代码快照 (JSON)”作为上下文传给 AI，实现精准的“增量修改”。
 
+## 后端数据结构基线（必须遵守）
+
+以下为当前项目后端数据结构的唯一基线，来源于 `supabase/schema.sql` 与线上已生效表结构。后续若修改表结构，必须同步更新 `supabase/schema.sql` 与本节文档，避免前后端字段漂移。
+
+### 1) public.profiles（用户资料）
+
+- 主键：`id uuid`，外键指向 `auth.users(id)`。
+- 字段：
+	- `id uuid primary key references auth.users(id) on delete cascade`
+	- `email text unique`
+	- `username text not null`
+	- `avatar_url text`
+	- `updated_at timestamptz not null default now()`
+- 约束与策略：
+	- 开启 RLS。
+	- 仅允许用户读写自己的 profile（基于 `auth.uid() = id`）。
+
+### 2) public.projects（项目）
+
+- 主键：`id uuid`。
+- 字段：
+	- `id uuid primary key default gen_random_uuid()`
+	- `user_id uuid not null references auth.users(id) on delete cascade`
+	- `name text not null`
+	- `is_public boolean not null default false`
+	- `share_token text not null default encode(gen_random_bytes(12), 'hex')`
+	- `created_at timestamptz not null default now()`
+	- `updated_at timestamptz not null default now()`
+- 索引：
+	- `idx_projects_share_token_unique`（share_token 唯一）
+	- `idx_projects_user_updated`（user_id, updated_at desc）
+- 约束与策略：
+	- 开启 RLS。
+	- 用户只能读写自己的项目（`auth.uid() = user_id`）。
+
+### 3) public.project_files（项目文件）
+
+- 主键：`id uuid`。
+- 字段：
+	- `id uuid primary key default gen_random_uuid()`
+	- `project_id uuid not null references public.projects(id) on delete cascade`
+	- `path text not null`
+	- `content text not null default ''`
+	- `created_at timestamptz not null default now()`
+	- `updated_at timestamptz not null default now()`
+- 约束与索引：
+	- `unique(project_id, path)`
+	- `idx_project_files_project_path`（project_id, path）
+- 约束与策略：
+	- 开启 RLS。
+	- 通过关联 `projects.user_id = auth.uid()` 控制访问。
+
+### 4) public.chat_sessions（会话）
+
+- 主键：`id uuid`。
+- 字段：
+	- `id uuid primary key default gen_random_uuid()`
+	- `project_id uuid not null references public.projects(id) on delete cascade`
+	- `created_at timestamptz not null default now()`
+	- `updated_at timestamptz not null default now()`
+- 索引：
+	- `idx_chat_sessions_project_updated`（project_id, updated_at desc）
+- 约束与策略：
+	- 开启 RLS。
+	- 通过关联 `projects.user_id = auth.uid()` 控制访问。
+
+### 5) public.chat_messages（消息）
+
+- 主键：`id uuid`。
+- 字段：
+	- `id uuid primary key default gen_random_uuid()`
+	- `session_id uuid not null references public.chat_sessions(id) on delete cascade`
+	- `role text not null check (role in ('user', 'agent'))`
+	- `agent_name text`
+	- `agent_role text`
+	- `content text not null default ''`
+	- `status text not null default 'thinking' check (status in ('thinking', 'streaming', 'done', 'stopped', 'error'))`
+	- `created_at timestamptz not null default now()`
+	- `updated_at timestamptz not null default now()`
+- 索引：
+	- `idx_chat_messages_session_created`（session_id, created_at asc）
+- 约束与策略：
+	- 开启 RLS。
+	- 通过 `chat_sessions -> projects -> user_id` 级联限制访问。
+
+### 6) 通用约定
+
+- 统一 `updated_at` 触发器函数：`public.set_updated_at_timestamp()`（`set search_path = public`）。
+- `projects / project_files / chat_sessions / chat_messages` 在更新时自动刷新 `updated_at`。
+- `profiles` 通过触发器 `set_profiles_updated_at`（函数 `public.set_profile_updated_at()`）在更新时自动刷新 `updated_at`。
+- 前端字段读取契约：
+	- 用户资料：`profiles(email, username, avatar_url)`。
+	- 项目列表：`projects(id, name, updated_at, is_public, share_token)`。
+	- 会话消息：`chat_messages(role, agent_name, agent_role, content, status, created_at)`。
+
 ## 头像同步规则（Google OAuth）
 
 - 初始化策略：当用户首次通过 Google 登录且 `profiles.avatar_url` 为空时，使用 Google 返回的头像 URL（`user.user_metadata.avatar_url` 或 `picture`）写入 `profiles.avatar_url`。

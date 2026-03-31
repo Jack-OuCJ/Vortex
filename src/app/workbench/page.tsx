@@ -2,25 +2,126 @@
 
 import React, { Suspense, useState, useEffect, useCallback, useRef } from "react";
 import { motion } from "framer-motion";
-import { Send, RefreshCw, Maximize2, Sparkles, Square } from "lucide-react";
+import { RefreshCw, Send, Square } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import {
-  SandpackProvider,
-  SandpackLayout,
-  SandpackFileExplorer,
-  SandpackPreview,
-  useSandpack,
-  SandpackCodeEditor,
-} from "@codesandbox/sandpack-react";
+import { MonacoCodeEditor } from "@/components/MonacoCodeEditor";
+import { useWebContainer } from "@/hooks/useWebContainer";
+import { useChatStore } from "@/stores/chatStore";
+import { useProjectStore } from "@/stores/projectStore";
+import { useUiStore } from "@/stores/uiStore";
+
+type ProjectSummary = {
+  id: string;
+  name: string;
+};
+
+type ProjectFile = {
+  path: string;
+  content: string;
+  updated_at?: string;
+};
+
+type AgentStreamEvent = {
+  eventType?: "agent";
+  agent: "pm" | "architect" | "engineer" | "debug";
+  name: string;
+  status: "thinking" | "done" | "error" | "streaming";
+  content?: string;
+  projectFiles?: Array<{ path: string; code: string }>;
+};
+
+type SessionStreamEvent = {
+  eventType: "session";
+  sessionId: string;
+};
+
+type StepStreamEvent = {
+  eventType: "step";
+  stepId: "pm" | "architect" | "engineer" | "debug" | "direct_reply";
+  title: string;
+  status: "running" | "done" | "error";
+  detail?: string;
+};
+
+type ToolStreamEvent = {
+  eventType: "tool";
+  callId: string;
+  action: "tool_start" | "tool_input_delta" | "tool_result" | "tool_error";
+  toolName:
+    | "analyze_demand"
+    | "plan_architecture"
+    | "generate_project_files"
+    | "debug_fix"
+    | "read_file"
+    | "write_file";
+  detail?: string;
+};
+
+type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent;
+
+const isThinkingOrStreaming = (status?: "thinking" | "done" | "error" | "streaming") =>
+  status === "thinking" || status === "streaming";
+
+const buildMergeCandidate = (localContent: string, serverContent: string, serverUpdatedAt: string) => {
+  return [
+    "<<<<<<< local",
+    localContent,
+    "=======",
+    serverContent,
+    `>>>>>>> remote (${serverUpdatedAt})`,
+  ].join("\n");
+};
 
 export function WorkbenchContent() {
-  const [activeTab, setActiveTab] = useState<"preview" | "code">("preview");
-  const [inputValue, setInputValue] = useState("");
+  const {
+    activeTab,
+    setActiveTab,
+    sidebarWidth,
+    setSidebarWidth,
+    steps,
+    resetSteps,
+    upsertStep,
+  } = useUiStore();
+  const {
+    projectId,
+    projectName,
+    sessionId,
+    isBootstrapping,
+    files: projectFiles,
+    fileTimestamps,
+    conflictCandidates,
+    activeFilePath,
+    setProjectMeta,
+    setSessionId,
+    setIsBootstrapping,
+    setRemoteFiles,
+    upsertFiles,
+    setFileTimestamps,
+    upsertConflictCandidates,
+    clearConflictCandidate,
+    updateActiveFile,
+    setActiveFilePath,
+  } = useProjectStore();
+  const {
+    inputValue,
+    setInputValue,
+    messages,
+    isGenerating,
+    setIsGenerating,
+    appendMessage,
+    upsertAgentMessage,
+    updateLastAgentMessage,
+  } = useChatStore();
+
   const [nowTs, setNowTs] = useState<number | null>(null);
+  const [previewRefreshSeed, setPreviewRefreshSeed] = useState(0);
+  const [isCopyingShareLink, setIsCopyingShareLink] = useState(false);
   
-  const [isGenerating, setIsGenerating] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const lastManualEditAtRef = useRef<Record<string, number>>({});
+  const { isReady: isContainerReady, serverUrl, logs, syncFiles, writeFile } = useWebContainer();
 
   const handleStop = () => {
     if (abortControllerRef.current) {
@@ -31,25 +132,6 @@ export function WorkbenchContent() {
   useEffect(() => {
     setNowTs(Date.now());
   }, []);
-
-  const mockInitialMessages = [
-    {
-      agent: "pm",
-      name: "Emma",
-      avatar: "/teams-avatar/pm.png",
-      content:
-        "Hi! I am Emma, your Product Manager. What are we building today?",
-      timestamp: new Date("2026-03-29T12:00:00").getTime(),
-    },
-    {
-      agent: "engineer",
-      name: "Alex",
-      avatar: "/teams-avatar/50-engineer.png",
-      content:
-        "Alex here! Ready to dive into the code and build something great.",
-      timestamp: new Date("2026-03-31T12:30:00").getTime(),
-    },
-  ];
 
   const formatMessageTime = (ts?: number) => {
     if (!ts) return "";
@@ -77,18 +159,6 @@ export function WorkbenchContent() {
     return `${date.getMonth() + 1}月 ${date.getDate()}, ${date.getFullYear()}`;
   };
 
-  const [messages, setMessages] = useState<any[]>(mockInitialMessages);
-  const [sandpackFiles, setSandpackFiles] = useState<Record<string, string>>({
-    "/App.tsx": `export default function App() {
-  return (
-    <div style={{ padding: 20, fontFamily: 'sans-serif' }}>
-      <h1>Hello from Atom's Multi-Agent Demo</h1>
-      <p>This is a live preview of your generated app.</p>
-    </div>
-  )
-}`,
-  });
-
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -99,20 +169,174 @@ export function WorkbenchContent() {
     scrollToBottom();
   }, [messages]);
 
+  useEffect(() => {
+    let mounted = true;
+
+    const bootstrapProject = async () => {
+      try {
+        const listRes = await fetch("/api/projects", { method: "GET" });
+        if (!listRes.ok) {
+          return;
+        }
+
+        const listJson = (await listRes.json()) as { projects?: ProjectSummary[] };
+        let activeProject = listJson.projects?.[0];
+
+        if (!activeProject) {
+          const createRes = await fetch("/api/projects", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: `Project ${new Date().toISOString().slice(0, 16)}` }),
+          });
+
+          if (!createRes.ok) {
+            return;
+          }
+
+          const createJson = (await createRes.json()) as { project?: ProjectSummary };
+          activeProject = createJson.project;
+        }
+
+        if (!activeProject || !mounted) return;
+
+        setProjectMeta(activeProject.id, activeProject.name);
+
+        const filesRes = await fetch(`/api/projects/${activeProject.id}/files`, {
+          method: "GET",
+        });
+
+        if (!filesRes.ok) {
+          return;
+        }
+
+        const filesJson = (await filesRes.json()) as { files?: ProjectFile[] };
+        if (!mounted) return;
+        setRemoteFiles(filesJson.files ?? []);
+      } catch (error) {
+        console.error("Failed to bootstrap project", error);
+      } finally {
+        if (mounted) {
+          setIsBootstrapping(false);
+        }
+      }
+    };
+
+    void bootstrapProject();
+
+    return () => {
+      mounted = false;
+    };
+  }, [setIsBootstrapping, setProjectMeta, setRemoteFiles]);
+
+  useEffect(() => {
+    if (!projectId || isBootstrapping) {
+      return;
+    }
+
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+
+    saveTimerRef.current = window.setTimeout(() => {
+      const files = Object.entries(projectFiles).map(([path, content]) => ({
+        path,
+        content,
+        expectedUpdatedAt: fileTimestamps[path] ?? null,
+      }));
+
+      void fetch(`/api/projects/${projectId}/files`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files }),
+      })
+        .then(async (response) => {
+          const isConflict = response.status === 409;
+          if (!response.ok && !isConflict) {
+            return;
+          }
+
+          const payload = (await response.json()) as {
+            fileTimestamps?: Array<{ path: string; updated_at: string }>;
+            conflicts?: Array<{
+              path: string;
+              expectedUpdatedAt: string | null;
+              serverUpdatedAt: string;
+              serverContent: string;
+            }>;
+          };
+
+          if (Array.isArray(payload.fileTimestamps) && payload.fileTimestamps.length) {
+            setFileTimestamps(payload.fileTimestamps);
+          }
+
+          if (Array.isArray(payload.conflicts) && payload.conflicts.length) {
+            const candidates = payload.conflicts.map((conflict) => {
+              const localContent = projectFiles[conflict.path] ?? "";
+              return {
+                path: conflict.path,
+                localContent,
+                serverContent: conflict.serverContent,
+                mergedContent: buildMergeCandidate(
+                  localContent,
+                  conflict.serverContent,
+                  conflict.serverUpdatedAt
+                ),
+                serverUpdatedAt: conflict.serverUpdatedAt,
+              };
+            });
+
+            upsertConflictCandidates(candidates);
+
+            payload.conflicts.forEach((conflict) => {
+              upsertStep({
+                id: `server-conflict:${conflict.path}`,
+                title: "服务端冲突拦截",
+                status: "error",
+                detail: `${conflict.path} 已在其他会话更新，请刷新后重试`,
+              });
+            });
+          }
+        })
+        .catch(() => {
+          // noop
+        });
+    }, 1000);
+
+    return () => {
+      if (saveTimerRef.current) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, [
+    fileTimestamps,
+    isBootstrapping,
+    projectFiles,
+    projectId,
+    setFileTimestamps,
+    upsertConflictCandidates,
+    upsertStep,
+  ]);
+
+  useEffect(() => {
+    if (!isContainerReady || isBootstrapping) {
+      return;
+    }
+
+    void syncFiles(projectFiles);
+  }, [isBootstrapping, isContainerReady, projectFiles, syncFiles]);
+
   const handleSend = async () => {
     if (!inputValue.trim() || isGenerating) return;
     const userMsg = inputValue.trim();
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        agent: "user",
-        name: "You",
-        avatar: "/teams-avatar/Leader.png",
-        content: userMsg,
-        timestamp: Date.now(),
-      },
-    ]);
+    appendMessage({
+      agent: "user",
+      name: "You",
+      avatar: "/teams-avatar/Leader.png",
+      content: userMsg,
+      timestamp: Date.now(),
+    });
+    resetSteps();
     setInputValue("");
     
     setIsGenerating(true);
@@ -120,12 +344,17 @@ export function WorkbenchContent() {
 
     try {
       // Create project files array format for backend
-      const currentFiles = Object.entries(sandpackFiles).map(([path, code]) => ({ path, code }));
+      const currentFiles = Object.entries(projectFiles).map(([path, code]) => ({ path, code }));
 
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMsg, projectFiles: currentFiles }),
+        body: JSON.stringify({
+          message: userMsg,
+          projectFiles: currentFiles,
+          projectId,
+          sessionId,
+        }),
         signal: abortControllerRef.current.signal,
       });
 
@@ -134,18 +363,72 @@ export function WorkbenchContent() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
 
+      let sseBuffer = "";
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
-        const chunk = decoder.decode(value);
-        const lines = chunk.split("\n");
+
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split("\n");
+        sseBuffer = lines.pop() ?? "";
 
         for (const line of lines) {
           if (line.startsWith("data: ")) {
             try {
-              const data = JSON.parse(line.slice(6));
+              const data = JSON.parse(line.slice(6)) as StreamEvent;
+
+              if (data.eventType === "session") {
+                setSessionId(data.sessionId);
+                continue;
+              }
+
+              if (data.eventType === "step") {
+                upsertStep({
+                  id: data.stepId,
+                  title: data.title,
+                  status: data.status,
+                  detail: data.detail,
+                });
+                continue;
+              }
+
+              if (data.eventType === "tool") {
+                const stepId = `tool:${data.callId}`;
+                const title = `工具: ${data.toolName}`;
+
+                if (data.action === "tool_start" || data.action === "tool_input_delta") {
+                  upsertStep({
+                    id: stepId,
+                    title,
+                    status: "running",
+                    detail: data.detail,
+                  });
+                }
+
+                if (data.action === "tool_result") {
+                  upsertStep({
+                    id: stepId,
+                    title,
+                    status: "done",
+                    detail: data.detail,
+                  });
+                }
+
+                if (data.action === "tool_error") {
+                  upsertStep({
+                    id: stepId,
+                    title,
+                    status: "error",
+                    detail: data.detail,
+                  });
+                }
+
+                continue;
+              }
               
+              const agentData = data as AgentStreamEvent;
+
               const avatarMap: Record<string, string> = {
                 pm: "/teams-avatar/pm.png",
                 architect: "/teams-avatar/50-engineer.png",
@@ -153,62 +436,60 @@ export function WorkbenchContent() {
                 debug: "/teams-avatar/50-engineer.png",
               };
               
-              const avatar = avatarMap[data.agent] || avatarMap.engineer;
+              const avatar = avatarMap[agentData.agent] || avatarMap.engineer;
 
-              setMessages((prev) => {
-                const newMsgs = [...prev];
-                // Find last message by this specific agent to update status
-                const lastIdx = newMsgs.map(m => m.name).lastIndexOf(data.name);
-                
-                if (lastIdx !== -1 && ["thinking", "streaming"].includes(newMsgs[lastIdx].status)) {
-                  newMsgs[lastIdx] = {
-                    ...newMsgs[lastIdx],
-                    content: data.content || newMsgs[lastIdx].content,
-                    status: data.status,
-                  };
-                } else {
-                  newMsgs.push({
-                    agent: data.agent,
-                    name: data.name,
-                    avatar,
-                    content: data.content || "",
-                    status: data.status,
-                    timestamp: Date.now(),
-                  });
-                }
-                return newMsgs;
+              upsertAgentMessage({
+                agent: agentData.agent,
+                name: agentData.name,
+                avatar,
+                content: agentData.content || "",
+                status: agentData.status,
+                timestamp: Date.now(),
               });
 
-              if (data.projectFiles && Array.isArray(data.projectFiles)) {
-                setSandpackFiles((prevFiles) => {
-                  const updatedFiles = { ...prevFiles };
-                  data.projectFiles.forEach((f: any) => {
-                    updatedFiles[f.path] = f.code;
-                  });
-                  return updatedFiles;
+              const generatedFiles = agentData.projectFiles;
+              if (generatedFiles && Array.isArray(generatedFiles)) {
+                const now = Date.now();
+                const safeFiles = generatedFiles.filter((f) => {
+                  const lastEditAt = lastManualEditAtRef.current[f.path] ?? 0;
+                  const isRecentlyEdited = now - lastEditAt < 1500;
+
+                  if (isRecentlyEdited) {
+                    upsertStep({
+                      id: `conflict:${f.path}`,
+                      title: "文件冲突保护",
+                      status: "running",
+                      detail: `${f.path} 最近正在编辑，暂不覆盖 Agent 结果`,
+                    });
+                  }
+
+                  return !isRecentlyEdited;
                 });
+
+                safeFiles.forEach((f) => {
+                  void writeFile(f.path, f.code);
+                });
+
+                if (safeFiles.length) {
+                  upsertFiles(safeFiles);
+                }
               }
-            } catch (e) {
+            } catch {
               // Ignore partial JSON chunks gracefully
             }
           }
         }
       }
-    } catch (e: any) {
-      if (e.name === "AbortError") {
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") {
         console.log("Chat stream aborted by user");
-        setMessages((prev) => {
-          const newMsgs = [...prev];
-          const lastIdx = newMsgs.length - 1;
-          if (lastIdx >= 0 && ["thinking", "streaming"].includes(newMsgs[lastIdx].status)) {
-            newMsgs[lastIdx] = {
-              ...newMsgs[lastIdx],
-              status: "error",
-              content: newMsgs[lastIdx].content + " 🛑 (已终止)",
-            };
-          }
-          return newMsgs;
-        });
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && isThinkingOrStreaming(lastMessage.status)) {
+          updateLastAgentMessage(lastMessage.name, {
+            status: "error",
+            content: lastMessage.content + " 🛑 (已终止)",
+          });
+        }
       } else {
         console.error("Chat Error:", e);
       }
@@ -225,7 +506,6 @@ export function WorkbenchContent() {
     }
   };
 
-  const [sidebarWidth, setSidebarWidth] = useState(25);
   const [isResizing, setIsResizing] = useState(false);
 
   const startResizing = useCallback(() => setIsResizing(true), []);
@@ -240,7 +520,7 @@ export function WorkbenchContent() {
         }
       }
     },
-    [isResizing]
+    [isResizing, setSidebarWidth]
   );
 
   useEffect(() => {
@@ -251,6 +531,103 @@ export function WorkbenchContent() {
       window.removeEventListener("mouseup", stopResizing);
     };
   }, [resize, stopResizing]);
+
+  const sortedFilePaths = Object.keys(projectFiles).sort();
+
+  const handleEditorChange = (path: string, nextCode: string) => {
+    lastManualEditAtRef.current[path] = Date.now();
+    updateActiveFile(path, nextCode);
+    void writeFile(path, nextCode);
+  };
+
+  const handleRefreshPreview = () => {
+    setPreviewRefreshSeed((prev) => prev + 1);
+  };
+
+  const handleCopyShareLink = async () => {
+    if (!projectId || isCopyingShareLink) {
+      return;
+    }
+
+    setIsCopyingShareLink(true);
+    try {
+      const patchRes = await fetch(`/api/projects/${projectId}/share`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isPublic: true }),
+      });
+
+      if (!patchRes.ok) {
+        throw new Error(`Failed to enable sharing (${patchRes.status})`);
+      }
+
+      const patchJson = (await patchRes.json()) as { shareUrl?: string };
+      if (!patchJson.shareUrl) {
+        throw new Error("Missing share URL");
+      }
+
+      await navigator.clipboard.writeText(patchJson.shareUrl);
+      upsertStep({
+        id: "share-link",
+        title: "分享链接",
+        status: "done",
+        detail: "分享链接已复制到剪贴板",
+      });
+    } catch (error) {
+      upsertStep({
+        id: "share-link",
+        title: "分享链接",
+        status: "error",
+        detail: error instanceof Error ? error.message : "复制分享链接失败",
+      });
+    } finally {
+      setIsCopyingShareLink(false);
+    }
+  };
+
+  const handleApplyMergedCandidate = (path: string) => {
+    const candidate = conflictCandidates[path];
+    if (!candidate) return;
+
+    updateActiveFile(path, candidate.mergedContent);
+    void writeFile(path, candidate.mergedContent);
+    setFileTimestamps([{ path, updated_at: candidate.serverUpdatedAt }]);
+    clearConflictCandidate(path);
+    upsertStep({
+      id: `server-conflict:${path}`,
+      title: "冲突合并候选已应用",
+      status: "done",
+      detail: `${path} 已写入本地合并候选，保存后将再次对账`,
+    });
+  };
+
+  const handleApplyRemoteVersion = (path: string) => {
+    const candidate = conflictCandidates[path];
+    if (!candidate) return;
+
+    updateActiveFile(path, candidate.serverContent);
+    void writeFile(path, candidate.serverContent);
+    setFileTimestamps([{ path, updated_at: candidate.serverUpdatedAt }]);
+    clearConflictCandidate(path);
+    upsertStep({
+      id: `server-conflict:${path}`,
+      title: "已应用远端版本",
+      status: "done",
+      detail: `${path} 已同步到服务端最新版本`,
+    });
+  };
+
+  const handleDismissConflictCandidate = (path: string) => {
+    clearConflictCandidate(path);
+    upsertStep({
+      id: `server-conflict:${path}`,
+      title: "冲突候选已忽略",
+      status: "done",
+      detail: `${path} 冲突提示已关闭`,
+    });
+  };
+
+  const conflictList = Object.values(conflictCandidates);
 
   return (
     <div className="flex w-full h-screen bg-background text-foreground font-sans overflow-hidden">
@@ -275,6 +652,71 @@ export function WorkbenchContent() {
             ATOMS
           </span>
         </Link>
+
+        <div className="px-6 pb-2 text-xs text-muted-foreground/70 truncate">
+          {projectName}
+        </div>
+
+        {!!steps.length && (
+          <div className="px-6 pb-3 space-y-2">
+            {steps.map((step) => (
+              <div key={step.id} className="rounded-lg border border-border/50 bg-background/60 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-foreground/90">{step.title}</span>
+                  <span
+                    className={`text-[10px] px-2 py-0.5 rounded-full ${
+                      step.status === "running"
+                        ? "bg-blue-500/20 text-blue-300"
+                        : step.status === "done"
+                          ? "bg-emerald-500/20 text-emerald-300"
+                          : "bg-red-500/20 text-red-300"
+                    }`}
+                  >
+                    {step.status}
+                  </span>
+                </div>
+                {step.detail && (
+                  <p className="text-[11px] text-muted-foreground mt-1">{step.detail}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!!conflictList.length && (
+          <div className="px-6 pb-3 space-y-2">
+            {conflictList.map((candidate) => (
+              <div key={candidate.path} className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-foreground/90">冲突文件: {candidate.path}</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => handleApplyMergedCandidate(candidate.path)}
+                      className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 transition-colors"
+                    >
+                      应用合并候选
+                    </button>
+                    <button
+                      onClick={() => handleApplyRemoteVersion(candidate.path)}
+                      className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-200 hover:bg-blue-500/30 transition-colors"
+                    >
+                      应用远端版本
+                    </button>
+                    <button
+                      onClick={() => handleDismissConflictCandidate(candidate.path)}
+                      className="text-[10px] px-2 py-0.5 rounded bg-muted/40 text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
+                    >
+                      忽略
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  远端已更新到 {candidate.serverUpdatedAt}，可先应用候选后再手工确认并保存。
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* Chat Flow Container */}
         <div className="flex-1 overflow-y-auto px-6 space-y-4 scrollbar-thin scrollbar-thumb-muted-foreground/30">
@@ -377,92 +819,96 @@ export function WorkbenchContent() {
         </div>
       </motion.div>
 
-      {/* --- Right Main Panel (Sandbox/Preview) --- */}
+      {/* --- Right Main Panel (Runtime/Preview) --- */}
       <div className="flex-1 h-full bg-background flex flex-col pt-2 border-none">
-        <SandpackProvider
-          template="react-ts"
-          files={sandpackFiles}
-          customSetup={{
-            dependencies: {
-              "lucide-react": "latest",
-              "framer-motion": "latest",
-            },
-          }}
-        >
-          {/* App Viewer Header / Tabs */}
-          <SandpackHeader activeTab={activeTab} setActiveTab={setActiveTab} />
+        <WorkbenchHeader
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          onRefreshPreview={handleRefreshPreview}
+          onCopyShareLink={handleCopyShareLink}
+          isCopyingShareLink={isCopyingShareLink}
+        />
 
-          {/* Sandpack Integration Workspace */}
-          <div className="flex-1 overflow-hidden relative px-6 pb-4 mt-2">
-            <div className="w-full h-full rounded-2xl overflow-hidden border border-border/40 shadow-sm flex flex-col bg-background/50">
-              <SandpackLayout
-                style={
-                  {
-                    height: "100%",
-                    border: "none",
-                    backgroundColor: "transparent",
-                    "--sp-colors-bg-default": "transparent",
-                  } as React.CSSProperties
-                }
-              >
-                {activeTab === "code" ? (
-                  <>
-                    <SandpackFileExplorer
-                      autoHiddenFiles={true}
-                      style={
-                        {
-                          width: "250px",
-                          height: "100%",
-                          borderRight: "1px solid var(--border)",
-                          backgroundColor: "transparent",
-                        } as React.CSSProperties
-                      }
-                    />
-                    <SandpackCodeEditor
-                      showLineNumbers
-                      showTabs
-                      style={{ height: "100%", flex: 1 }}
-                    />
-                  </>
-                ) : (
-                  <SandpackPreview
-                    showNavigator={false}
-                    showOpenInCodeSandbox={false}
-                    showRefreshButton={false}
-                    style={
-                      {
-                        flex: 1,
-                        height: "100%",
-                        backgroundColor: "transparent",
-                      } as React.CSSProperties
-                    }
+        <div className="flex-1 overflow-hidden relative px-6 pb-4 mt-2">
+          <div className="w-full h-full rounded-2xl overflow-hidden border border-border/40 shadow-sm flex flex-col bg-background/50">
+            {activeTab === "code" ? (
+              <div className="flex h-full">
+                <div className="w-64 border-r border-border/60 bg-muted/20 overflow-y-auto">
+                  {sortedFilePaths.map((path) => (
+                    <button
+                      key={path}
+                      onClick={() => setActiveFilePath(path)}
+                      className={`w-full text-left px-3 py-2 text-xs transition-colors border-b border-border/30 ${
+                        path === activeFilePath
+                          ? "bg-blue-500/15 text-foreground"
+                          : "text-muted-foreground hover:bg-muted/40"
+                      }`}
+                    >
+                      {path}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex-1">
+                  <MonacoCodeEditor
+                    activePath={activeFilePath}
+                    files={projectFiles}
+                    onCodeChange={handleEditorChange}
                   />
+                </div>
+              </div>
+            ) : (
+              <div className="h-full w-full bg-muted/10">
+                {serverUrl ? (
+                  <iframe
+                    key={`${serverUrl}-${previewRefreshSeed}`}
+                    title="ATOMS Preview"
+                    src={serverUrl}
+                    className="w-full h-full border-0"
+                  />
+                ) : (
+                  <div className="h-full w-full flex flex-col items-center justify-center text-sm text-muted-foreground px-6 text-center gap-3">
+                    <p>正在启动 WebContainer 运行时...</p>
+                    <p className="text-xs text-muted-foreground/70">
+                      {isContainerReady ? "容器已启动，正在安装依赖并启动开发服务器" : "正在初始化容器内核"}
+                    </p>
+                    {!!logs.length && (
+                      <div className="max-w-3xl w-full bg-black/80 text-green-300 rounded-lg p-3 text-left text-xs overflow-auto max-h-36">
+                        {logs.slice(-8).map((line, idx) => (
+                          <div key={idx}>{line}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
-              </SandpackLayout>
-            </div>
+              </div>
+            )}
           </div>
-        </SandpackProvider>
+        </div>
       </div>
     </div>
   );
 }
 
-function SandpackHeader({
+function WorkbenchHeader({
   activeTab,
   setActiveTab,
+  onRefreshPreview,
+  onCopyShareLink,
+  isCopyingShareLink,
 }: {
   activeTab: "preview" | "code";
   setActiveTab: (tab: "preview" | "code") => void;
+  onRefreshPreview: () => void;
+  onCopyShareLink: () => void;
+  isCopyingShareLink: boolean;
 }) {
-  const { sandpack, dispatch } = useSandpack();
-
   return (
     <div className="flex items-center justify-between px-6 shrink-0 z-10">
       <div className="flex items-center gap-1.5">
         <button
           onClick={() => {
             setActiveTab("preview");
-            dispatch({ type: "refresh" });
+            onRefreshPreview();
           }}
           className={`flex items-center justify-center transition-all overflow-hidden ${
             activeTab === "preview"
@@ -508,17 +954,19 @@ function SandpackHeader({
 
       <div className="flex items-center gap-2">
         <button
-          onClick={() => dispatch({ type: "refresh" })}
+          onClick={onCopyShareLink}
+          className="rounded-lg px-2.5 h-7 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          title="复制分享预览链接"
+          disabled={isCopyingShareLink}
+        >
+          {isCopyingShareLink ? "处理中..." : "复制分享链接"}
+        </button>
+        <button
+          onClick={onRefreshPreview}
           className="rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors flex items-center justify-center h-7 w-7"
           title="重新加载应用查看器"
         >
-          <Image
-            src="/workbench/refresh-cw.svg"
-            alt="Reload"
-            width={14}
-            height={14}
-            className="opacity-70 group-hover:opacity-100 dark:invert"
-          />
+          <RefreshCw className="w-4 h-4" />
         </button>
       </div>
     </div>
