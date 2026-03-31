@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import { motion } from "framer-motion";
 import { Plus, ArrowRight } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
 import { SidebarAndHeader } from "@/components/SidebarAndHeader";
+import { useRouter } from "next/navigation";
 
 type UserProfile = {
   email: string | null;
@@ -19,6 +20,8 @@ type AgentBadge = {
   role: string;
 };
 
+
+
 const AGENTS: AgentBadge[] = [
   { src: "/teams-avatar/Leader.png", name: "Emma", role: "团队领导" },
   { src: "/teams-avatar/seo.png", name: "Sarah", role: "SEO专家" },
@@ -29,6 +32,8 @@ const AGENTS: AgentBadge[] = [
   { src: "/teams-avatar/deep-researcher.png", name: "Maya", role: "深度研究员" },
 ];
 
+
+
 export default function HomeClient({
   user,
   profile,
@@ -38,7 +43,21 @@ export default function HomeClient({
 }) {
   const [prompt, setPrompt] = useState("");
   const [isSidebarPinned, setIsSidebarPinned] = useState(false);
+  const router = useRouter();
+
   const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
+
+  const handleSubmit = useCallback(() => {
+    if (!canSubmit) return;
+    router.push(`/workbench?prompt=${encodeURIComponent(prompt.trim())}`);
+  }, [canSubmit, prompt, router]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
 
   return (
     <div
@@ -110,6 +129,7 @@ export default function HomeClient({
             <textarea
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={handleKeyDown}
               placeholder="创建一个具有用户登录和数据库存储功能的SaaS订阅应用..."
               className="h-[88px] w-full resize-none rounded-xl border-0 bg-transparent p-2 text-[16px] text-foreground outline-none placeholder:text-foreground/40"
             />
@@ -124,6 +144,7 @@ export default function HomeClient({
 
               <button
                 disabled={!canSubmit}
+                onClick={handleSubmit}
                 className="inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-semibold text-primary-foreground transition-all duration-300 disabled:cursor-not-allowed disabled:bg-primary/50 disabled:text-primary-foreground/85 enabled:bg-primary enabled:hover:scale-105 enabled:hover:bg-primary/90"
               >
                 免费开始
@@ -131,6 +152,8 @@ export default function HomeClient({
               </button>
             </div>
           </motion.div>
+
+
         </motion.section>
       </main>
     </div>
