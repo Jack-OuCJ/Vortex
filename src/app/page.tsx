@@ -7,5 +7,21 @@ export default async function Home() {
     data: { user },
   } = await supabase.auth.getUser();
 
-  return <HomeClient user={user} />;
+  let profile: {
+    email: string | null;
+    username: string | null;
+    avatar_url: string | null;
+  } | null = null;
+
+  if (user) {
+    const { data } = await supabase
+      .from("profiles")
+      .select("email, username, avatar_url")
+      .eq("id", user.id)
+      .maybeSingle();
+
+    profile = data ?? null;
+  }
+
+  return <HomeClient user={user} profile={profile} />;
 }

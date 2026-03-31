@@ -6,6 +6,12 @@ import { Plus, ArrowRight } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
 import { SidebarAndHeader } from "@/components/SidebarAndHeader";
 
+type UserProfile = {
+  email: string | null;
+  username: string | null;
+  avatar_url: string | null;
+};
+
 type AgentBadge = {
   label: string;
   bg: string;
@@ -21,16 +27,26 @@ const AGENTS: AgentBadge[] = [
   { label: "I", bg: "#b586e6" },
 ];
 
-export default function HomeClient({ user }: { user: User | null }) {
+export default function HomeClient({
+  user,
+  profile,
+}: {
+  user: User | null;
+  profile: UserProfile | null;
+}) {
   const [prompt, setPrompt] = useState("");
   const [isSidebarPinned, setIsSidebarPinned] = useState(false);
   const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
 
   return (
     <div
-      className={`page-atoms-bg min-h-screen w-full text-foreground transition-all duration-300 ${isSidebarPinned && user ? "pl-64" : ""}`}
+      className={`bg-background min-h-screen w-full text-foreground transition-all duration-300 ${isSidebarPinned && user ? "pl-64" : ""}`}
     >
-      <SidebarAndHeader user={user} onSidebarChange={setIsSidebarPinned} />
+      <SidebarAndHeader
+        user={user}
+        profile={profile}
+        onSidebarChange={setIsSidebarPinned}
+      />
 
       <main className="mx-auto flex w-full max-w-[1200px] flex-col items-center px-4 pb-14 pt-24 sm:px-6 sm:pt-32 lg:pt-36">
         <motion.section
@@ -70,7 +86,7 @@ export default function HomeClient({ user }: { user: User | null }) {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ delay: 0.22, duration: 0.45 }}
-            className="mt-8 w-full max-w-[700px] rounded-[16px] border border-black/5 bg-[#f1f1f1] p-2.5 shadow-[0_4px_20px_rgba(17,24,39,0.06)] transition-all duration-300 hover:scale-[1.01] dark:bg-[#1f1f21] dark:border-white/10"
+            className="mt-8 w-full max-w-[700px] rounded-[16px] border-border bg-muted p-2.5 shadow-sm transition-all duration-300 hover:scale-[1.01] border "
           >
             <textarea
               value={prompt}
@@ -89,7 +105,7 @@ export default function HomeClient({ user }: { user: User | null }) {
 
               <button
                 disabled={!canSubmit}
-                className="inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-semibold text-white transition-all duration-300 disabled:cursor-not-allowed disabled:bg-[#b4baf7] disabled:text-white/85 enabled:bg-[#7a8cf3] enabled:hover:scale-105 enabled:hover:bg-[#6579eb] dark:enabled:bg-[#6377e8] dark:enabled:hover:bg-[#5266de]"
+                className="inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-semibold text-primary-foreground transition-all duration-300 disabled:cursor-not-allowed disabled:bg-primary/50 disabled:text-primary-foreground/85 enabled:bg-primary enabled:hover:scale-105 enabled:hover:bg-primary/90"
               >
                 免费开始
                 <ArrowRight className="size-4" />

@@ -16,18 +16,92 @@ import { useTheme } from "next-themes";
 import { motion, AnimatePresence } from "framer-motion";
 import { getBrowserSupabaseClient } from "@/lib/supabase-browser";
 
+type UserProfile = {
+  email: string | null;
+  username: string | null;
+  avatar_url: string | null;
+};
+
 export function SidebarAndHeader({
   user,
+  profile,
   onSidebarChange,
 }: {
   user: User | null;
+  profile: UserProfile | null;
   onSidebarChange?: (pinned: boolean) => void;
 }) {
+  const [resolvedUser, setResolvedUser] = useState<User | null>(user);
+  const [resolvedProfile, setResolvedProfile] =
+    useState<UserProfile | null>(profile);
   const [isHovered, setIsHovered] = useState(false);
   const [isPinned, setIsPinned] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
   const { theme, setTheme } = useTheme();
+
+  useEffect(() => {
+    setResolvedUser(user);
+  }, [user]);
+
+  useEffect(() => {
+    setResolvedProfile(profile);
+  }, [profile]);
+
+  useEffect(() => {
+    const supabase = getBrowserSupabaseClient();
+    if (!supabase) return;
+
+    let cancelled = false;
+
+    const loadProfile = async (userId: string) => {
+      const { data } = await supabase
+        .from("profiles")
+        .select("email, username, avatar_url")
+        .eq("id", userId)
+        .maybeSingle();
+
+      if (!cancelled) {
+        setResolvedProfile(data ?? null);
+      }
+    };
+
+    const syncAuth = async () => {
+      const {
+        data: { user: nextUser },
+      } = await supabase.auth.getUser();
+
+      if (cancelled) return;
+      setResolvedUser(nextUser ?? null);
+
+      if (nextUser) {
+        await loadProfile(nextUser.id);
+      } else {
+        setResolvedProfile(null);
+      }
+    };
+
+    void syncAuth();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      const nextUser = session?.user ?? null;
+      setResolvedUser(nextUser);
+
+      if (nextUser) {
+        void loadProfile(nextUser.id);
+      } else {
+        setResolvedProfile(null);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     // Avoid synchronous setState in effect
@@ -54,11 +128,23 @@ export function SidebarAndHeader({
     window.location.href = "/login";
   };
 
-  const showSidebar = user && (isPinned || isHovered);
+  const profileEmail = resolvedProfile?.email ?? resolvedUser?.email ?? "";
+  const profileName =
+    resolvedProfile?.username?.trim() ||
+    profileEmail.split("@")[0] ||
+    "用户";
+  const profileAvatarUrl = resolvedProfile?.avatar_url?.trim() || null;
+  const avatarFallback = profileName[0]?.toUpperCase() || "U";
+
+  useEffect(() => {
+    setAvatarLoadFailed(false);
+  }, [profileAvatarUrl]);
+
+  const showSidebar = resolvedUser && (isPinned || isHovered);
 
   return (
     <>
-      {user && !isPinned && (
+      {resolvedUser && !isPinned && (
         <div
           className="fixed left-0 top-0 bottom-0 w-6 z-40"
           onMouseEnter={() => setIsHovered(true)}
@@ -66,22 +152,22 @@ export function SidebarAndHeader({
       )}
 
       <header
-        className={`fixed top-0 left-0 right-0 h-16 flex items-center justify-between px-4 sm:px-6 transition-all duration-300 z-30 ${isPinned && user ? "pl-72" : ""}`}
+        className={`fixed top-0 left-0 right-0 h-16 flex items-center justify-between px-4 sm:px-6 transition-all duration-300 z-30 ${isPinned && resolvedUser ? "pl-72" : ""}`}
       >
         <div className="flex items-center gap-4">
-          {!user || (!isPinned && !isHovered) ? (
+          {!resolvedUser || (!isPinned && !isHovered) ? (
             <Link
               href="/"
               className="group inline-flex items-center gap-2 rounded-full px-1 py-1.5"
             >
-              <Atom className="size-5 text-[#1b1b1d] dark:text-[#ededef] transition-transform duration-300 group-hover:scale-105" />
+              <Atom className="size-5 text-foreground transition-transform duration-300 group-hover:scale-105" />
               <span className="text-[22px] font-semibold tracking-tight text-foreground">
                 Atoms
               </span>
             </Link>
           ) : null}
 
-          {user && !isPinned && !isHovered && (
+          {resolvedUser && !isPinned && !isHovered && (
             <button
               onMouseEnter={() => setIsHovered(true)}
               className="opacity-40 hover:opacity-100 transition-opacity p-2 -ml-2 select-none flex items-center justify-center cursor-pointer"
@@ -92,17 +178,17 @@ export function SidebarAndHeader({
           )}
         </div>
 
-        {!user && (
+        {!resolvedUser && (
           <div className="flex items-center gap-2 text-sm z-50">
             <Link
               href="/login"
-              className="rounded-full border border-black/5 dark:border-white/10 bg-[#ececec] dark:bg-[#2a2a2c] px-4 py-1.5 font-medium text-black/85 dark:text-white/85 transition-all duration-300 hover:scale-105 hover:bg-[#e2e2e2] dark:hover:bg-[#333]"
+              className="rounded-full border border-border bg-muted px-4 py-1.5 font-medium text-black/85 dark:text-white/85 transition-all duration-300 hover:scale-105 hover:bg-black/5 dark:hover:bg-white/5"
             >
               登录
             </Link>
             <Link
               href="/login"
-              className="rounded-full bg-[#3f64ff] px-4 py-1.5 font-medium text-white transition-all duration-300 hover:scale-105 hover:bg-[#3558eb]"
+              className="rounded-full bg-primary px-4 py-1.5 font-medium text-primary-foreground transition-all duration-300 hover:scale-105 hover:bg-primary/90"
             >
               注册
             </Link>
@@ -112,24 +198,24 @@ export function SidebarAndHeader({
 
       {/* Sidebar background overlay for mobile/hover only */}
       <AnimatePresence>
-        {isHovered && !isPinned && user && (
+        {isHovered && !isPinned && resolvedUser && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/5 dark:bg-black/20 z-40"
+            className="fixed inset-0 z-40"
             onClick={() => setIsHovered(false)}
           />
         )}
       </AnimatePresence>
 
-      {user && (
+      {resolvedUser && (
         <motion.aside
           initial={{ x: "-100%" }}
           animate={{ x: showSidebar ? 0 : "-100%" }}
           transition={{ type: "spring", damping: 25, stiffness: 200 }}
           onMouseLeave={() => !isPinned && setIsHovered(false)}
-          className={`fixed top-0 left-0 bottom-0 w-64 bg-[#f9f9f9] dark:bg-[#111113] border-r border-black/5 dark:border-white/5 z-50 flex flex-col`}
+          className={`fixed top-0 left-0 bottom-0 w-64 bg-muted border-r border-border z-50 flex flex-col`}
         >
           <div className="flex items-center justify-between h-16 px-4">
             <Link
@@ -139,7 +225,7 @@ export function SidebarAndHeader({
                 if (!isPinned) setIsHovered(false);
               }}
             >
-              <Atom className="size-5 text-[#1b1b1d] dark:text-[#ededef] transition-transform duration-300 group-hover:scale-105 flex-shrink-0" />
+              <Atom className="size-5 text-foreground transition-transform duration-300 group-hover:scale-105 flex-shrink-0" />
               <span className="text-[18px] font-semibold tracking-tight text-foreground truncate">
                 Atoms
               </span>
@@ -175,18 +261,27 @@ export function SidebarAndHeader({
           </div>
 
           {/* Bottom user card */}
-          <div className="p-3 border-t border-black/5 dark:border-white/5 relative">
+          <div className="p-3 border-t border-border relative">
             <button
               onClick={() => setMenuOpen(!menuOpen)}
               className="w-full flex items-center justify-between p-2 rounded-lg hover:bg-foreground/5 transition-colors text-left"
             >
               <div className="flex items-center gap-2.5 overflow-hidden">
-                <div className="size-8 rounded-full bg-gradient-to-tr from-[#3f64ff] to-[#ffb06f] flex-shrink-0 flex items-center justify-center text-white text-xs font-bold shadow-sm">
-                  {user.email?.[0].toUpperCase()}
-                </div>
+                {profileAvatarUrl && !avatarLoadFailed ? (
+                  <img
+                    src={profileAvatarUrl}
+                    alt={profileName}
+                    onError={() => setAvatarLoadFailed(true)}
+                    className="size-8 rounded-full object-cover flex-shrink-0 shadow-sm"
+                  />
+                ) : (
+                  <div className="size-8 rounded-full bg-black flex-shrink-0 flex items-center justify-center text-white text-xs font-bold shadow-sm">
+                    {avatarFallback}
+                  </div>
+                )}
                 <div className="flex flex-col overflow-hidden">
                   <span className="text-sm font-medium text-foreground/85 truncate leading-tight">
-                    {user.email?.split("@")[0]}
+                    {profileName}
                   </span>
                   <span className="text-[11px] text-foreground/40 truncate leading-tight mt-0.5">
                     Free Plan
@@ -202,7 +297,7 @@ export function SidebarAndHeader({
                 <span>500 / 500</span>
               </div>
               <div className="h-1.5 w-full bg-foreground/10 rounded-full overflow-hidden">
-                <div className="h-full bg-[#3f64ff] w-full rounded-full" />
+                <div className="h-full bg-primary w-full rounded-full" />
               </div>
             </div>
 
@@ -222,10 +317,10 @@ export function SidebarAndHeader({
                   >
                     <div className="px-3 pt-2 pb-3 mb-1 border-b border-foreground/5 flex flex-col">
                       <span className="text-sm font-medium text-foreground/90 truncate">
-                        {user.email?.split("@")[0]}
+                        {profileName}
                       </span>
                       <span className="text-xs text-foreground/40 truncate mt-0.5">
-                        {user.email}
+                        {profileEmail}
                       </span>
                     </div>
 
@@ -250,7 +345,7 @@ export function SidebarAndHeader({
                           </button>
                           <button
                             onClick={() => setTheme("dark")}
-                            className={`text-xs py-1 rounded-md transition-colors ${theme === "dark" ? "bg-[#333] shadow-[0_1px_2px_rgba(0,0,0,0.2)] text-white font-medium" : "text-foreground/60 hover:text-foreground"}`}
+                            className={`text-xs py-1 rounded-md transition-colors ${theme === "dark" ? "bg-background shadow-[0_1px_2px_rgba(0,0,0,0.1)] text-foreground font-medium" : "text-foreground/60 hover:text-foreground"}`}
                           >
                             深色
                           </button>

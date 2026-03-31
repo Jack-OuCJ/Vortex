@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import { getBrowserSupabaseClient } from "@/lib/supabase-browser";
 
@@ -11,11 +11,35 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [showEmailFormatError, setShowEmailFormatError] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isGoogleLoading, setIsGoogleLoading] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [successText, setSuccessText] = useState("");
 
   const hasEmail = useMemo(() => Boolean(email.trim()), [email]);
   const isEmailValid = useMemo(() => EMAIL_REGEX.test(email.trim()), [email]);
+
+  useEffect(() => {
+    const supabase = getBrowserSupabaseClient();
+    if (!supabase) return;
+
+    void supabase.auth.getSession().then(({ data }) => {
+      if (data.session) {
+        window.location.replace("/");
+      }
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_IN") {
+        window.location.replace("/");
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -62,8 +86,38 @@ export default function LoginPage() {
     setSuccessText("登录链接已发送，请检查邮箱");
   };
 
+  const handleGoogleLogin = async () => {
+    setErrorText("");
+    setSuccessText("");
+    setIsGoogleLoading(true);
+
+    const supabase = getBrowserSupabaseClient();
+    if (!supabase) {
+      setErrorText("Supabase 环境变量未配置完整");
+      setIsGoogleLoading(false);
+      return;
+    }
+
+    const redirectTo = `${window.location.origin}/auth/callback`;
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo,
+      },
+    });
+
+    // 正常情况下会跳转到 Google 页面，回到本页面才需要复位 loading。
+    if (error) {
+      setErrorText(error.message || "Google 登录请求失败");
+      setIsGoogleLoading(false);
+      return;
+    }
+
+    setIsGoogleLoading(false);
+  };
+
   return (
-    <div className="min-h-screen w-full bg-white text-[#1d1d20]">
+    <div className="min-h-screen w-full bg-background text-foreground">
       <div className="absolute left-6 top-6">
         <Link
           href="/"
@@ -76,17 +130,18 @@ export default function LoginPage() {
 
       <main className="flex min-h-screen w-full items-center justify-center px-4">
         <section className="w-full max-w-[340px]">
-          <h1 className="text-center text-[26px] font-bold tracking-tight text-black/90">
+          <h1 className="text-center text-[26px] font-bold tracking-tight text-foreground/90">
             登录或注册
           </h1>
-          <p className="mt-1.5 text-center text-[15px] font-medium text-[#878787]">
+          <p className="mt-1.5 text-center text-[15px] font-medium text-muted-foreground">
             开始使用 Atoms 创作
           </p>
 
           <button
             type="button"
-            disabled
-            className="mt-8 flex h-[44px] w-full items-center justify-center gap-2.5 rounded-[8px] border border-black/10 bg-white text-[14px] font-semibold text-black/75 shadow-[0_1px_2px_rgba(0,0,0,0.03)] transition-all hover:bg-black/5 disabled:cursor-not-allowed"
+            onClick={handleGoogleLogin}
+            disabled={isSending || isGoogleLoading}
+            className="mt-8 flex h-[44px] w-full items-center justify-center gap-2.5 rounded-[8px] border border-foreground/10 bg-background text-[14px] font-semibold text-foreground/75 shadow-[0_1px_2px_rgba(0,0,0,0.03)] transition-all hover:bg-foreground/5 disabled:cursor-not-allowed"
           >
             <svg
               viewBox="0 0 24 24"
@@ -110,10 +165,10 @@ export default function LoginPage() {
                 fill="#EA4335"
               />
             </svg>
-            使用 Google 继续
+            {isGoogleLoading ? "跳转中..." : "使用 Google 继续"}
           </button>
 
-          <div className="my-6 flex items-center gap-3 text-[12px] font-medium text-black/30">
+          <div className="my-6 flex items-center gap-3 text-[12px] font-medium text-foreground/30">
             <span className="h-[1px] flex-1 bg-black/5" />
             或
             <span className="h-[1px] flex-1 bg-black/5" />
@@ -137,10 +192,10 @@ export default function LoginPage() {
                   );
                 }}
                 placeholder="输入您的电子邮件地址"
-                className={`h-[44px] w-full rounded-[8px] border bg-[#f9f9f9] px-4 text-[14px] text-black/80 transition-colors outline-none placeholder:text-black/35 focus:bg-white ${
+                className={`h-[44px] w-full rounded-[8px] border bg-muted px-4 text-[14px] text-foreground/80 transition-colors outline-none placeholder:text-foreground/35 focus:bg-background ${
                   showEmailFormatError
                     ? "border-[#d04550] focus:border-[#d04550]"
-                    : "border-black/5 focus:border-black/20"
+                    : "border-black/5 focus:border-foreground/20"
                 }`}
               />
               {showEmailFormatError ? (
@@ -151,7 +206,7 @@ export default function LoginPage() {
             </div>
 
             <div>
-              <p className="text-center text-[12px] leading-relaxed text-[#a1a1a1]">
+              <p className="text-center text-[12px] leading-relaxed text-muted-foreground/80">
                 继续即表示您同意我们的
                 <span className="cursor-pointer font-medium underline underline-offset-2 hover:text-black/70 mx-1">
                   服务条款
@@ -181,7 +236,7 @@ export default function LoginPage() {
               className={`h-[44px] w-full mt-2 flex items-center justify-center rounded-[8px] text-[15px] font-semibold transition-all duration-300 disabled:cursor-not-allowed ${
                 hasEmail
                   ? "bg-black text-white enabled:hover:bg-black/85 shadow-[0_2px_4px_rgba(0,0,0,0.1)] hover:scale-[1.02]"
-                  : "bg-[#c6c6c6] text-white/90"
+                  : "bg-muted-foreground/40 text-white/90"
               }`}
             >
               {isSending ? (
