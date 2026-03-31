@@ -259,7 +259,7 @@ export function WorkbenchContent() {
         initial={{ x: "-100%", opacity: 0 }}
         animate={{ x: 0, opacity: 1 }}
         transition={{ duration: 0.5, ease: "easeOut" }}
-        className="min-w-[300px] h-full bg-muted/20 border-r border-border flex flex-col pt-6 relative"
+        className="min-w-[240px] h-full bg-muted/20 border-r border-border flex flex-col pt-5 relative"
         style={{ width: `${sidebarWidth}%` }}
       >
         <div
@@ -267,11 +267,11 @@ export function WorkbenchContent() {
           className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-blue-500/50 transition-colors z-50"
         />
         {/* Header Logo */}
-        <Link href="/" className="px-6 mb-6 flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer">
-          <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center shadow-sm">
-            <span className="text-white font-bold italic">A</span>
+        <Link href="/" className="px-5 mb-5 flex items-center gap-1.5 hover:opacity-80 transition-opacity cursor-pointer">
+          <div className="w-[26px] h-[26px] rounded-full bg-blue-600 flex items-center justify-center shadow-sm">
+            <span className="text-white font-bold italic text-xs">A</span>
           </div>
-          <span className="text-foreground font-bold text-lg tracking-wide">
+          <span className="text-foreground font-bold text-sm tracking-wide">
             ATOMS
           </span>
         </Link>
