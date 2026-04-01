@@ -136,7 +136,7 @@ export function SidebarProjectItem({ project }: { project: ProjectMeta }) {
               >
                 <h3 className="text-lg font-semibold tracking-tight">删除项目</h3>
                 <p className="text-sm text-foreground/70 leading-relaxed">
-                  您确定要删除项目 <span className="font-semibold text-foreground">"{project.name}"</span> 吗？此操作无法撤销。
+                  您确定要删除项目 <span className="font-semibold text-foreground">&quot;{project.name}&quot;</span> 吗？此操作无法撤销。
                 </p>
                 
                 <div className="mt-2 flex items-center justify-end gap-2">

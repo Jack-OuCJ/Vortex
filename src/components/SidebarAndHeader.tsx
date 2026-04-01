@@ -15,6 +15,8 @@ import {
 import { useTheme } from "next-themes";
 import { motion, AnimatePresence } from "framer-motion";
 import { getBrowserSupabaseClient } from "@/lib/supabase-browser";
+import { useHistoryStore } from "@/stores/historyStore";
+import { SidebarProjectItem } from "@/components/SidebarProjectItem";
 
 type UserProfile = {
   email: string | null;
@@ -40,6 +42,7 @@ export function SidebarAndHeader({
   const [menuOpen, setMenuOpen] = useState(false);
   const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
   const { theme, setTheme } = useTheme();
+  const { projects, isLoading, fetchProjects } = useHistoryStore();
 
   useEffect(() => {
     setResolvedUser(user);
@@ -48,6 +51,15 @@ export function SidebarAndHeader({
   useEffect(() => {
     setResolvedProfile(profile);
   }, [profile]);
+
+  useEffect(() => {
+    if (resolvedUser?.id) {
+      void fetchProjects(resolvedUser.id);
+      return;
+    }
+
+    void fetchProjects("");
+  }, [resolvedUser?.id, fetchProjects]);
 
   useEffect(() => {
     const supabase = getBrowserSupabaseClient();
@@ -250,14 +262,20 @@ export function SidebarAndHeader({
             <div className="text-xs font-semibold text-foreground/40 px-2 pt-2 pb-2">
               最近的项目
             </div>
-            <button className="w-full flex items-center gap-2.5 px-2 py-2 rounded-md hover:bg-foreground/5 text-sm text-foreground/75 transition-colors">
-              <MessageSquare className="size-4 opacity-70" />
-              <span className="truncate">SaaS 登录系统</span>
-            </button>
-            <button className="w-full flex items-center gap-2.5 px-2 py-2 rounded-md hover:bg-foreground/5 text-sm text-foreground/75 transition-colors">
-              <MessageSquare className="size-4 opacity-70" />
-              <span className="truncate">电商后台大屏</span>
-            </button>
+            {isLoading ? (
+              <div className="px-2 py-2 text-sm text-foreground/45">
+                正在加载项目...
+              </div>
+            ) : projects.length > 0 ? (
+              projects.slice(0, 8).map((project) => (
+                <SidebarProjectItem key={project.id} project={project} />
+              ))
+            ) : (
+              <div className="flex items-center gap-2.5 px-2 py-2 text-sm text-foreground/45">
+                <MessageSquare className="size-4 opacity-60" />
+                <span className="truncate">还没有历史项目</span>
+              </div>
+            )}
           </div>
 
           {/* Bottom user card */}

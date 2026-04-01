@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { appendFile, mkdir } from "node:fs/promises";
+import path from "node:path";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { Allow, parse as parsePartialJson } from "partial-json";
@@ -16,6 +18,7 @@ import {
   type WebContainerToolInputMap,
   type WebContainerToolName,
 } from "@/lib/webcontainer-bridge";
+import { formatWorkflowToolTitle, type WorkflowStep } from "@/lib/workflow";
 
 export const runtime = "nodejs";
 
@@ -32,6 +35,7 @@ type AgentEvent = {
   content?: string;
   projectFiles?: ProjectFile[];
   fileTimestamps?: Array<{ path: string; updated_at: string }>;
+  isFinalSnapshot?: boolean;
   isAppDemand?: boolean;
 };
 
@@ -71,12 +75,7 @@ type WebContainerRequestEvent = {
   request: WebContainerBridgeRequest;
 };
 
-type ProjectRenameEvent = {
-  eventType: "project_rename";
-  projectName: string;
-};
-
-type StreamEvent = AgentEvent | SessionEvent | StepEvent | ToolEvent | ProjectRenameEvent | WebContainerRequestEvent;
+type StreamEvent = AgentEvent | SessionEvent | StepEvent | ToolEvent | WebContainerRequestEvent;
 
 type RequestProjectFile = {
   path: string;
@@ -118,6 +117,7 @@ type PersistedChatMessage = {
   content: string;
   status: "thinking" | "streaming" | "done" | "stopped" | "error";
   created_at: string;
+  steps?: unknown;
 };
 
 type ToolLoopDecision =
@@ -147,11 +147,75 @@ type ToolLoopDecision =
 type FileToolLoopResult = {
   projectFiles: ProjectFile[];
   summary?: string;
+  finalized: boolean;
 };
 
 type ToolCallInput = Extract<ToolLoopDecision, { action: "tool_call" }>[
   "input"
 ];
+
+type DebugLogEntry = {
+  timestamp?: string;
+  sessionId?: string | null;
+  rootToolCallId?: string;
+  phase: string;
+  round?: number;
+  detail?: string;
+  payload?: unknown;
+};
+
+const PROJECT_ROOT_PATH = path.resolve(process.cwd());
+const DEBUG_DIR_PATH = path.join(PROJECT_ROOT_PATH, ".debug");
+const DEBUG_LOG_PATH = path.join(DEBUG_DIR_PATH, "alex-tool-loop.ndjson");
+let debugLogPathAnnounced = false;
+
+const serializeDebugLogEntry = (entry: DebugLogEntry) => {
+  return `${JSON.stringify({ ...entry, timestamp: new Date().toISOString() })}\n`;
+};
+
+const writeDebugLog = async (entry: DebugLogEntry) => {
+  try {
+    await mkdir(DEBUG_DIR_PATH, { recursive: true });
+
+    if (!debugLogPathAnnounced) {
+      debugLogPathAnnounced = true;
+      console.info(`[alex-debug] writing logs to ${DEBUG_LOG_PATH}`);
+      await appendFile(
+        DEBUG_LOG_PATH,
+        serializeDebugLogEntry({
+          phase: "debug-log-path",
+          detail: "Alex debug logs are written to the local repository .debug directory.",
+          payload: {
+            projectRootPath: PROJECT_ROOT_PATH,
+            debugDirPath: DEBUG_DIR_PATH,
+            debugLogPath: DEBUG_LOG_PATH,
+          },
+        }),
+        "utf8"
+      );
+    }
+
+    await appendFile(DEBUG_LOG_PATH, serializeDebugLogEntry(entry), "utf8");
+  } catch (error) {
+    console.error("Failed to write Alex debug log", error);
+  }
+};
+
+const extractProcessSnapshot = (result: WebContainerBridgeResult) => {
+  if (!result.ok || !result.data || typeof result.data !== "object") {
+    return null;
+  }
+
+  const record = result.data as Record<string, unknown>;
+  return typeof record.procId === "string"
+    ? {
+        procId: record.procId,
+        output: typeof record.output === "string" ? record.output : "",
+        completed: record.completed === true,
+        exitCode: typeof record.exitCode === "number" ? record.exitCode : null,
+      }
+    : null;
+};
 
 const parseJSONFromLLM = (content: string) => {
   try {
@@ -237,8 +301,97 @@ const sendEvent = (
 
 type PersistContext = {
   enabled: boolean;
+  projectId: string | null;
   sessionId: string | null;
   userMessage: string | null;
+  workflowSteps: WorkflowStep[];
+};
+
+const touchSessionActivity = async (
+  supabase: SupabaseServerClient,
+  sessionId: string | null
+) => {
+  if (!sessionId) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("chat_sessions")
+    .update({ updated_at: new Date().toISOString() })
+    .eq("id", sessionId);
+
+  if (error) {
+    console.error("Failed to touch chat session activity", sessionId, error.message);
+  }
+};
+
+const touchProjectActivity = async (
+  supabase: SupabaseServerClient,
+  projectId: string | null | undefined
+) => {
+  if (!projectId) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("projects")
+    .update({ updated_at: new Date().toISOString() })
+    .eq("id", projectId);
+
+  if (error) {
+    console.error("Failed to touch project activity", projectId, error.message);
+  }
+};
+
+const touchConversationActivity = async (
+  supabase: SupabaseServerClient,
+  ctx: Pick<PersistContext, "projectId" | "sessionId">
+) => {
+  await Promise.all([
+    touchSessionActivity(supabase, ctx.sessionId),
+    touchProjectActivity(supabase, ctx.projectId),
+  ]);
+};
+
+const recordWorkflowEvent = (ctx: PersistContext, payload: StreamEvent) => {
+  if (payload.eventType !== "step" && payload.eventType !== "tool") {
+    return;
+  }
+
+  const nextStep: WorkflowStep = payload.eventType === "step"
+    ? {
+        id: payload.stepId,
+        title: payload.title,
+        status: payload.status,
+        detail: payload.detail,
+        updatedAt: Date.now(),
+        source: "step",
+      }
+    : {
+        id: `tool:${payload.callId}`,
+        title: formatWorkflowToolTitle(payload.toolName),
+        status:
+          payload.action === "tool_result"
+            ? "done"
+            : payload.action === "tool_error"
+              ? "error"
+              : "running",
+        detail: payload.detail,
+        updatedAt: Date.now(),
+        source: "tool",
+        toolName: payload.toolName,
+      };
+
+  const index = ctx.workflowSteps.findIndex((step) => step.id === nextStep.id);
+  if (index === -1) {
+    ctx.workflowSteps.push(nextStep);
+    return;
+  }
+
+  ctx.workflowSteps[index] = {
+    ...ctx.workflowSteps[index],
+    ...nextStep,
+  };
 };
 
 type SupabaseServerClient = Awaited<ReturnType<typeof createClient>>;
@@ -266,12 +419,14 @@ const upsertAgentMessage = async (
         agent_role: payload.agent,
         content,
         status: "thinking",
+        steps: ctx.workflowSteps,
       })
       .select("id")
       .single();
 
     if (!error && data?.id) {
       agentMessageIds.set(key, data.id);
+      await touchConversationActivity(supabase, ctx);
     }
     return;
   }
@@ -282,19 +437,25 @@ const upsertAgentMessage = async (
     if (messageId) {
       await supabase
         .from("chat_messages")
-        .update({ content, status: payload.status })
+        .update({ content, status: payload.status, steps: ctx.workflowSteps })
         .eq("id", messageId);
+      await touchConversationActivity(supabase, ctx);
       return;
     }
 
-    await supabase.from("chat_messages").insert({
+    const { error } = await supabase.from("chat_messages").insert({
       session_id: ctx.sessionId,
       role: "agent",
       agent_name: payload.name,
       agent_role: payload.agent,
       content,
       status: payload.status,
+      steps: ctx.workflowSteps,
     });
+
+    if (!error) {
+      await touchConversationActivity(supabase, ctx);
+    }
   }
 };
 
@@ -319,6 +480,134 @@ const normalizeProjectFiles = (files: RequestProjectFile[] | undefined): Project
   return files
     .filter((file) => typeof file.path === "string" && typeof file.code === "string")
     .map((file) => ({ path: file.path, code: file.code }));
+};
+
+const INTERNAL_SUMMARY_MARKERS = [
+  "工具闭环",
+  "合规 final",
+  "已保留当前结果",
+];
+
+const isUserFacingExecutionSummary = (summary?: string) => {
+  if (typeof summary !== "string") {
+    return false;
+  }
+
+  const trimmed = summary.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return !INTERNAL_SUMMARY_MARKERS.some((marker) => trimmed.includes(marker));
+};
+
+const collectChangedProjectPaths = (baselineFiles: ProjectFile[], nextFiles: ProjectFile[]) => {
+  const baselineMap = new Map(baselineFiles.map((file) => [file.path, file.code]));
+  const nextMap = new Map(nextFiles.map((file) => [file.path, file.code]));
+  const changedPaths = new Set<string>();
+
+  baselineMap.forEach((code, filePath) => {
+    if (!nextMap.has(filePath) || nextMap.get(filePath) !== code) {
+      changedPaths.add(filePath);
+    }
+  });
+
+  nextMap.forEach((code, filePath) => {
+    if (!baselineMap.has(filePath) || baselineMap.get(filePath) !== code) {
+      changedPaths.add(filePath);
+    }
+  });
+
+  return Array.from(changedPaths).sort((left, right) => left.localeCompare(right));
+};
+
+const formatChangedPathList = (paths: string[], limit = 6) => {
+  if (!paths.length) {
+    return "未识别到具体文件路径";
+  }
+
+  const visible = paths.slice(0, limit);
+  return paths.length > limit
+    ? `${visible.join("、")} 等 ${paths.length} 个文件`
+    : visible.join("、");
+};
+
+const buildToolActivitySummary = (workflowSteps: WorkflowStep[]) => {
+  const toolCounts = workflowSteps.reduce<Record<string, number>>((acc, step) => {
+    if (step.source !== "tool" || !step.toolName || step.status !== "done") {
+      return acc;
+    }
+
+    acc[step.toolName] = (acc[step.toolName] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const activityParts = [
+    toolCounts["wc.fs.readFile"] ? `读取文件 ${toolCounts["wc.fs.readFile"]} 次` : null,
+    toolCounts["wc.fs.writeFile"] ? `写入文件 ${toolCounts["wc.fs.writeFile"]} 次` : null,
+    toolCounts["wc.fs.readdir"] ? `读取目录 ${toolCounts["wc.fs.readdir"]} 次` : null,
+    toolCounts["wc.fs.mkdir"] ? `创建目录 ${toolCounts["wc.fs.mkdir"]} 次` : null,
+    toolCounts["wc.fs.rm"] ? `删除路径 ${toolCounts["wc.fs.rm"]} 次` : null,
+    toolCounts["wc.spawn"] ? `执行命令 ${toolCounts["wc.spawn"]} 次` : null,
+  ].filter((part): part is string => Boolean(part));
+
+  return activityParts.length ? activityParts.join("，") : "已完成本轮工程流转并落库";
+};
+
+const buildVerificationSummary = (workflowSteps: WorkflowStep[]) => {
+  const successfulCommands = workflowSteps
+    .filter((step) => step.source === "tool" && step.toolName === "wc.spawn" && step.status === "done")
+    .map((step) => step.detail?.trim())
+    .filter((detail): detail is string => Boolean(detail));
+
+  if (successfulCommands.length) {
+    const visibleCommands = successfulCommands.slice(0, 2);
+    return successfulCommands.length > 2
+      ? `已执行 ${visibleCommands.join("；")} 等 ${successfulCommands.length} 项命令`
+      : `已执行 ${visibleCommands.join("；")}`;
+  }
+
+  const failedCommands = workflowSteps
+    .filter((step) => step.source === "tool" && step.toolName === "wc.spawn" && step.status === "error")
+    .map((step) => step.detail?.trim())
+    .filter((detail): detail is string => Boolean(detail));
+
+  if (failedCommands.length) {
+    return `尝试执行命令，但结果未成功：${failedCommands[0]}`;
+  }
+
+  return "未记录到额外命令验证";
+};
+
+const buildEngineerExecutionBrief = ({
+  summary,
+  finalized,
+  baselineFiles,
+  nextFiles,
+  workflowSteps,
+}: {
+  summary?: string;
+  finalized: boolean;
+  baselineFiles: ProjectFile[];
+  nextFiles: ProjectFile[];
+  workflowSteps: WorkflowStep[];
+}) => {
+  const cleanedSummary = typeof summary === "string" ? summary.trim().replace(/\s+/g, " ") : "";
+  const changedPaths = collectChangedProjectPaths(baselineFiles, nextFiles);
+  const completionLine = isUserFacingExecutionSummary(cleanedSummary)
+    ? cleanedSummary
+    : finalized
+      ? "已完成本轮需求对应的代码实现，并同步了项目文件。"
+      : "已完成本轮主要代码改动，虽然工具未返回标准 final，但改动结果已经保留。";
+
+  return [
+    "本轮开发已完成，以下是小结：",
+    `1. 完成内容：${completionLine}`,
+    `2. 变更文件：${formatChangedPathList(changedPaths)}`,
+    `3. 工程动作：${buildToolActivitySummary(workflowSteps)}`,
+    `4. 验证情况：${buildVerificationSummary(workflowSteps)}`,
+    "5. 详细过程可在“工作流程”中展开查看。",
+  ].join("\n");
 };
 
 const normalizeFileTree = (items: RequestFileTreeItem[] | undefined): RequestFileTreeItem[] => {
@@ -599,6 +888,10 @@ const persistChangedProjectFiles = async ({
     }
   }
 
+  if (rowsToUpsert.length || removedPaths.length) {
+    await touchProjectActivity(supabase, projectId);
+  }
+
   if (!rowsToUpsert.length) {
     return [] as Array<{ path: string; updated_at: string }>;
   }
@@ -826,6 +1119,7 @@ const runFileToolLoop = async ({
   maxRounds = 4,
 }: FileToolLoopParams): Promise<FileToolLoopResult> => {
   const fileMap = new Map<string, string>();
+  const knownProcIds = new Set<string>();
   initialFiles.forEach((file) => fileMap.set(file.path, file.code));
   const initialTodo = fileMap.get("/todo.md") ?? null;
 
@@ -833,13 +1127,41 @@ const runFileToolLoop = async ({
     new SystemMessage(buildEngineerToolLoopPrompt(agentName)),
     new HumanMessage(taskInput),
   ];
+  const sendTrackedEvent = (payload: StreamEvent) => {
+    recordWorkflowEvent(persistCtx, payload);
+    sendEvent(controller, encoder, payload);
+  };
 
   let projectFilesResult: ProjectFile[] = [];
   let summary: string | undefined;
   let finalized = false;
 
+  await writeDebugLog({
+    sessionId: persistCtx.sessionId,
+    rootToolCallId,
+    phase: "tool-loop-start",
+    payload: {
+      agentName,
+      requireTodoUpdate,
+      maxRounds,
+      initialFileCount: initialFiles.length,
+      taskInput,
+    },
+  });
+
   for (let round = 1; round <= maxRounds; round += 1) {
-    sendEvent(controller, encoder, {
+    await writeDebugLog({
+      sessionId: persistCtx.sessionId,
+      rootToolCallId,
+      phase: "round-start",
+      round,
+      detail: `工具闭环第 ${round} 轮`,
+      payload: {
+        knownProcIds: Array.from(knownProcIds),
+      },
+    });
+
+    sendTrackedEvent({
       eventType: "tool",
       callId: rootToolCallId,
       action: "tool_input_delta",
@@ -865,8 +1187,29 @@ const runFileToolLoop = async ({
     let decision: ToolLoopDecision;
     try {
       decision = parseToolLoopDecision(loopText);
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "llm-output",
+        round,
+        payload: {
+          raw: loopText,
+          parsed: decision,
+        },
+      });
     } catch (error) {
-      sendEvent(controller, encoder, {
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "llm-output-parse-error",
+        round,
+        detail: error instanceof Error ? error.message : "工具闭环解析失败",
+        payload: {
+          raw: loopText,
+        },
+      });
+
+      sendTrackedEvent({
         eventType: "tool",
         callId: rootToolCallId,
         action: "tool_error",
@@ -887,7 +1230,20 @@ const runFileToolLoop = async ({
       const candidateTodo = candidateFiles.find((file) => file.path === "/todo.md")?.code ?? null;
 
       if (!hasMeaningfulFileChange(initialFiles, candidateFiles)) {
-        sendEvent(controller, encoder, {
+        await writeDebugLog({
+          sessionId: persistCtx.sessionId,
+          rootToolCallId,
+          phase: "final-rejected",
+          round,
+          detail: "final 未包含有效代码改动",
+          payload: {
+            summary: decision.summary,
+            files: decision.files.map((file) => file.path),
+            deletedPaths: decision.deletedPaths,
+          },
+        });
+
+        sendTrackedEvent({
           eventType: "tool",
           callId: rootToolCallId,
           action: "tool_input_delta",
@@ -904,7 +1260,18 @@ const runFileToolLoop = async ({
       }
 
       if (requireTodoUpdate && candidateTodo === initialTodo) {
-        sendEvent(controller, encoder, {
+        await writeDebugLog({
+          sessionId: persistCtx.sessionId,
+          rootToolCallId,
+          phase: "final-rejected",
+          round,
+          detail: "/todo.md 未更新",
+          payload: {
+            summary: decision.summary,
+          },
+        });
+
+        sendTrackedEvent({
           eventType: "tool",
           callId: rootToolCallId,
           action: "tool_input_delta",
@@ -923,11 +1290,67 @@ const runFileToolLoop = async ({
       finalized = true;
       projectFilesResult = candidateFiles;
       summary = decision.summary;
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "final-accepted",
+        round,
+        payload: {
+          summary,
+          files: candidateFiles.map((file) => file.path),
+        },
+      });
       break;
     }
 
+    if (
+      (decision.tool === "wc.readProcess" || decision.tool === "wc.killProcess") &&
+      decision.input.procId &&
+      !knownProcIds.has(decision.input.procId)
+    ) {
+      const invalidProcId = decision.input.procId;
+      const knownProcIdList = Array.from(knownProcIds);
+      const guidance = knownProcIdList.length
+        ? `未知 procId: ${invalidProcId}。你只能使用真实返回过的 procId。当前可用 procId: ${knownProcIdList.join(", ")}。如果上一轮 wc.spawn 使用了 waitForExit=true，请直接根据工具结果中的 exitCode 和 output 判断，无需再读进程。`
+        : `未知 procId: ${invalidProcId}。当前还没有任何可用 procId。你需要先调用 wc.spawn，并使用工具结果里真实返回的 procId；不要自己发明 build 这类名字。`;
+
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "invalid-proc-id",
+        round,
+        detail: guidance,
+        payload: {
+          attemptedDecision: decision,
+          knownProcIds: knownProcIdList,
+        },
+      });
+
+      sendTrackedEvent({
+        eventType: "tool",
+        callId: rootToolCallId,
+        action: "tool_error",
+        toolName: rootToolName,
+        detail: `检测到无效 procId: ${invalidProcId}`,
+      });
+
+      toolLoopMessages.push(new HumanMessage(guidance));
+      continue;
+    }
+
     const callId = createToolCallId(decision.tool);
-    sendEvent(controller, encoder, {
+    await writeDebugLog({
+      sessionId: persistCtx.sessionId,
+      rootToolCallId,
+      phase: "tool-request",
+      round,
+      payload: {
+        callId,
+        decision,
+      },
+    });
+
+    sendTrackedEvent({
       eventType: "tool",
       callId,
       action: "tool_start",
@@ -940,7 +1363,7 @@ const runFileToolLoop = async ({
       createBridgeRequestInput(decision.tool, decision.input) as WebContainerToolInputMap[typeof decision.tool]
     );
 
-    sendEvent(controller, encoder, {
+    sendTrackedEvent({
       eventType: "webcontainer_request",
       request: bridge.request,
     });
@@ -948,8 +1371,33 @@ const runFileToolLoop = async ({
     let bridgeResult: WebContainerBridgeResult;
     try {
       bridgeResult = await bridge.resultPromise;
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "tool-result",
+        round,
+        payload: {
+          callId,
+          tool: decision.tool,
+          input: decision.input,
+          result: bridgeResult,
+        },
+      });
     } catch (error) {
-      sendEvent(controller, encoder, {
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "tool-result-error",
+        round,
+        detail: error instanceof Error ? error.message : "WebContainer bridge 调用失败",
+        payload: {
+          callId,
+          tool: decision.tool,
+          input: decision.input,
+        },
+      });
+
+      sendTrackedEvent({
         eventType: "tool",
         callId,
         action: "tool_error",
@@ -969,6 +1417,11 @@ const runFileToolLoop = async ({
     }
 
     if (bridgeResult.ok) {
+      const processSnapshot = decision.tool === "wc.spawn" ? extractProcessSnapshot(bridgeResult) : null;
+      if (processSnapshot?.procId) {
+        knownProcIds.add(processSnapshot.procId);
+      }
+
       if (decision.tool === "wc.fs.writeFile" && decision.input.path) {
         fileMap.set(decision.input.path, decision.input.content ?? "");
       }
@@ -982,7 +1435,7 @@ const runFileToolLoop = async ({
         }
       }
 
-      sendEvent(controller, encoder, {
+      sendTrackedEvent({
         eventType: "tool",
         callId,
         action: "tool_result",
@@ -990,7 +1443,7 @@ const runFileToolLoop = async ({
         detail: bridgeResult.detail ?? `${decision.tool} 执行成功`,
       });
     } else {
-      sendEvent(controller, encoder, {
+      sendTrackedEvent({
         eventType: "tool",
         callId,
         action: "tool_error",
@@ -1013,9 +1466,21 @@ const runFileToolLoop = async ({
     projectFilesResult = fallbackFiles.length ? fallbackFiles : initialFiles;
   }
 
+  await writeDebugLog({
+    sessionId: persistCtx.sessionId,
+    rootToolCallId,
+    phase: finalized ? "tool-loop-finished" : "tool-loop-fallback",
+    payload: {
+      finalized,
+      summary,
+      resultFileCount: projectFilesResult.length,
+    },
+  });
+
   return {
     projectFiles: projectFilesResult,
     summary,
+    finalized,
   };
 };
 
@@ -1034,6 +1499,10 @@ const invokeWithStream = async (
   let fullContent = "";
   let lastDeltaLength = 0;
   let lastPreview = "";
+  const sendTrackedEvent = (payload: StreamEvent) => {
+    recordWorkflowEvent(persistCtx, payload);
+    sendEvent(controller, encoder, payload);
+  };
   for await (const chunk of stream) {
     const textChunk = typeof chunk.content === "string" ? chunk.content : "";
     if (!textChunk) continue;
@@ -1059,7 +1528,7 @@ const invokeWithStream = async (
       }
       lastPreview = detail;
 
-      sendEvent(controller, encoder, {
+      sendTrackedEvent({
         eventType: "tool",
         callId: toolContext.callId,
         action: "tool_input_delta",
@@ -1068,12 +1537,14 @@ const invokeWithStream = async (
       });
     }
     
-    await emitEvent(controller, encoder, {
-      agent: agentType,
-      name: agentName,
-      status: "streaming",
-      content: cleanThinkTags(fullContent),
-    }, persistCtx, agentMessageIds);
+    if (!toolContext) {
+      await emitEvent(controller, encoder, {
+        agent: agentType,
+        name: agentName,
+        status: "streaming",
+        content: cleanThinkTags(fullContent),
+      }, persistCtx, agentMessageIds);
+    }
   }
   return cleanThinkTags(fullContent);
 };
@@ -1115,13 +1586,34 @@ export async function POST(req: Request) {
           const agentMessageIds = new Map<string, string>();
 
           if (projectId && !activeSessionId) {
-            const { data } = await supabase
+            const { data: existingSession, error: existingSessionError } = await supabase
               .from("chat_sessions")
-              .insert({ project_id: projectId })
               .select("id")
-              .single();
+              .eq("project_id", projectId)
+              .order("updated_at", { ascending: false })
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
 
-            activeSessionId = data?.id ?? null;
+            if (existingSessionError) {
+              throw existingSessionError;
+            }
+
+            if (existingSession?.id) {
+              activeSessionId = existingSession.id;
+            } else {
+              const { data: createdSession, error: createSessionError } = await supabase
+                .from("chat_sessions")
+                .insert({ project_id: projectId })
+                .select("id")
+                .single();
+
+              if (createSessionError) {
+                throw createSessionError;
+              }
+
+              activeSessionId = createdSession?.id ?? null;
+            }
           }
 
           if (activeSessionId) {
@@ -1138,17 +1630,27 @@ export async function POST(req: Request) {
 
           const persistCtx: PersistContext = {
             enabled: Boolean(projectId && activeSessionId),
+            projectId: projectId ?? null,
             sessionId: activeSessionId,
             userMessage: typeof message === "string" ? message : null,
+            workflowSteps: [],
+          };
+          const sendTrackedEvent = (payload: StreamEvent) => {
+            recordWorkflowEvent(persistCtx, payload);
+            sendEvent(controller, encoder, payload);
           };
 
           if (persistCtx.enabled && persistCtx.userMessage) {
-            await supabase.from("chat_messages").insert({
+            const { error } = await supabase.from("chat_messages").insert({
               session_id: persistCtx.sessionId,
               role: "user",
               content: persistCtx.userMessage,
               status: "done",
             });
+
+            if (!error) {
+              await touchConversationActivity(supabase, persistCtx);
+            }
           }
 
           const llm = createModel();
@@ -1166,7 +1668,7 @@ export async function POST(req: Request) {
             };
           } else {
             const routeToolCallId = createToolCallId("route_request");
-            sendEvent(controller, encoder, {
+            sendTrackedEvent({
               eventType: "step",
               stepId: "route",
               title: "任务判断",
@@ -1174,7 +1676,7 @@ export async function POST(req: Request) {
               detail: "工程师正在判断这是聊天还是开发任务",
             });
 
-            sendEvent(controller, encoder, {
+            sendTrackedEvent({
               eventType: "tool",
               callId: routeToolCallId,
               action: "tool_start",
@@ -1225,7 +1727,7 @@ export async function POST(req: Request) {
                 shouldWriteTodo: parsed.shouldWriteTodo !== false,
               };
             } catch (error) {
-              sendEvent(controller, encoder, {
+              sendTrackedEvent({
                 eventType: "tool",
                 callId: routeToolCallId,
                 action: "tool_error",
@@ -1235,7 +1737,7 @@ export async function POST(req: Request) {
               throw error;
             }
 
-            sendEvent(controller, encoder, {
+            sendTrackedEvent({
               eventType: "tool",
               callId: routeToolCallId,
               action: "tool_result",
@@ -1243,7 +1745,7 @@ export async function POST(req: Request) {
               detail: `已识别模式: ${routeDecision.mode}`,
             });
 
-            sendEvent(controller, encoder, {
+            sendTrackedEvent({
               eventType: "step",
               stepId: "route",
               title: "任务判断",
@@ -1280,15 +1782,8 @@ export async function POST(req: Request) {
             return;
           }
 
-          if (routeDecision.mode === "build" && routeDecision.projectName) {
-            sendEvent(controller, encoder, {
-              eventType: "project_rename",
-              projectName: routeDecision.projectName,
-            });
-          }
-
           const executeToolCallId = createToolCallId("execute_task");
-          sendEvent(controller, encoder, {
+          sendTrackedEvent({
             eventType: "step",
             stepId: "execute",
             title: "工程执行",
@@ -1296,7 +1791,7 @@ export async function POST(req: Request) {
             detail: `工程师正在处理 ${routeDecision.mode} 任务`,
           });
 
-          sendEvent(controller, encoder, {
+          sendTrackedEvent({
             eventType: "tool",
             callId: executeToolCallId,
             action: "tool_start",
@@ -1350,7 +1845,7 @@ export async function POST(req: Request) {
           let fileTimestamps: Array<{ path: string; updated_at: string }> = [];
 
           if (hasFileChanges) {
-            sendEvent(controller, encoder, {
+            sendTrackedEvent({
               eventType: "tool",
               callId: executeToolCallId,
               action: "tool_input_delta",
@@ -1366,7 +1861,7 @@ export async function POST(req: Request) {
                 nextFiles: executionResult.projectFiles,
               });
             } catch (error) {
-              sendEvent(controller, encoder, {
+              sendTrackedEvent({
                 eventType: "tool",
                 callId: executeToolCallId,
                 action: "tool_error",
@@ -1376,7 +1871,15 @@ export async function POST(req: Request) {
             }
           }
 
-          sendEvent(controller, encoder, {
+          sendTrackedEvent({
+            eventType: "step",
+            stepId: "execute",
+            title: "工程执行",
+            status: hasFileChanges ? "done" : "error",
+            detail: hasFileChanges ? "本轮任务已完成" : "未检测到有效文件改动",
+          });
+
+          sendTrackedEvent({
             eventType: "tool",
             callId: executeToolCallId,
             action: "tool_result",
@@ -1386,51 +1889,50 @@ export async function POST(req: Request) {
               : "执行完成，但未检测到有效文件改动",
           });
 
+          const finalEngineerContent = hasFileChanges
+            ? buildEngineerExecutionBrief({
+                summary: executionResult.summary,
+                finalized: executionResult.finalized,
+                baselineFiles: projectFiles,
+                nextFiles: executionResult.projectFiles,
+                workflowSteps: persistCtx.workflowSteps,
+              })
+            : "本轮没有形成有效文件改动，请补充更具体的需求。";
+
           await emitEvent(controller, encoder, {
             agent: "engineer",
             name: "Alex",
             status: "done",
-            content:
-              executionResult.summary ||
-              (hasFileChanges
-                ? "本轮任务已完成，代码和项目文件已经同步。"
-                : "本轮没有形成有效文件改动，请补充更具体的需求。"),
+            content: finalEngineerContent,
             projectFiles: executionResult.projectFiles,
             fileTimestamps,
+            isFinalSnapshot: executionResult.finalized,
           }, persistCtx, agentMessageIds);
-
-          sendEvent(controller, encoder, {
-            eventType: "step",
-            stepId: "execute",
-            title: "工程执行",
-            status: hasFileChanges ? "done" : "error",
-            detail: hasFileChanges ? "本轮任务已完成" : "未检测到有效文件改动",
-          });
 
           controller.close();
         } catch (streamError) {
           console.error("====== AGENT STREAM ERROR ======");
           console.error(streamError);
-          sendEvent(controller, encoder, {
+          sendTrackedEvent({
             eventType: "tool",
             callId: createToolCallId("execute_task"),
             action: "tool_error",
             toolName: "execute_task",
             detail: streamError instanceof Error ? streamError.message : "未知错误",
           });
-          sendEvent(controller, encoder, {
+          sendTrackedEvent({
             eventType: "step",
             stepId: "execute",
             title: "工程执行",
             status: "error",
             detail: "流处理失败",
           });
-          sendEvent(controller, encoder, {
+          await emitEvent(controller, encoder, {
             agent: "engineer",
             name: "Alex",
             status: "error",
             content: "生成失败，请稍后重试。",
-          });
+          }, persistCtx, agentMessageIds);
           controller.close();
         }
       },

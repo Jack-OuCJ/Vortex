@@ -46,9 +46,11 @@ export default function HomeClient({
 }) {
   const [prompt, setPrompt] = useState("");
   const [isSidebarPinned, setIsSidebarPinned] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const router = useRouter();
 
-  const { projects, fetchProjects, isLoading } = useHistoryStore();
+  const { projects, fetchProjects } = useHistoryStore();
 
   useEffect(() => {
     if (user?.id) {
@@ -58,10 +60,73 @@ export default function HomeClient({
 
   const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
 
-  const handleSubmit = useCallback(() => {
-    if (!canSubmit) return;
-    router.push(`/workbench?prompt=${encodeURIComponent(prompt.trim())}&newProject=true`);
-  }, [canSubmit, prompt, router]);
+  const handleSubmit = useCallback(async () => {
+    if (!canSubmit || isSubmitting) return;
+
+    const trimmedPrompt = prompt.trim();
+    setSubmitError("");
+
+    if (!user) {
+      router.push("/login");
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      const titleRes = await fetch("/api/projects/title", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: trimmedPrompt }),
+      });
+
+      if (titleRes.status === 401) {
+        router.push("/login");
+        return;
+      }
+
+      if (!titleRes.ok) {
+        throw new Error("项目命名失败，请稍后重试");
+      }
+
+      const titleJson = (await titleRes.json()) as { projectName?: string };
+      const projectName = titleJson.projectName?.trim();
+
+      if (!projectName) {
+        throw new Error("项目命名失败，请稍后重试");
+      }
+
+      const createRes = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: projectName }),
+      });
+
+      if (createRes.status === 401) {
+        router.push("/login");
+        return;
+      }
+
+      if (!createRes.ok) {
+        throw new Error("项目创建失败，请稍后重试");
+      }
+
+      const createJson = (await createRes.json()) as { project?: { id: string } };
+      const projectId = createJson.project?.id;
+
+      if (!projectId) {
+        throw new Error("项目创建失败，请稍后重试");
+      }
+
+      router.push(
+        `/workbench?project_id=${projectId}&prompt=${encodeURIComponent(trimmedPrompt)}&newProject=true`
+      );
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : "启动项目失败，请稍后重试");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [canSubmit, isSubmitting, prompt, router, user]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -139,10 +204,16 @@ export default function HomeClient({
           >
             <textarea
               value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
+              onChange={(event) => {
+                setPrompt(event.target.value);
+                if (submitError) {
+                  setSubmitError("");
+                }
+              }}
               onKeyDown={handleKeyDown}
               placeholder="创建一个具有用户登录和数据库存储功能的SaaS订阅应用..."
               className="h-[88px] w-full resize-none rounded-xl border-0 bg-transparent p-2 text-[16px] text-foreground outline-none placeholder:text-foreground/40"
+              disabled={isSubmitting}
             />
 
             <div className="mt-2 flex items-center justify-between px-2 pb-1">
@@ -154,14 +225,18 @@ export default function HomeClient({
               </button>
 
               <button
-                disabled={!canSubmit}
+                disabled={!canSubmit || isSubmitting}
                 onClick={handleSubmit}
                 className="inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-semibold text-primary-foreground transition-all duration-300 disabled:cursor-not-allowed disabled:bg-primary/50 disabled:text-primary-foreground/85 enabled:bg-primary enabled:hover:scale-105 enabled:hover:bg-primary/90"
               >
-                免费开始
+                {isSubmitting ? "准备项目中..." : "免费开始"}
                 <ArrowRight className="size-4" />
               </button>
             </div>
+
+            {submitError ? (
+              <p className="px-2 pb-1 text-sm text-red-500">{submitError}</p>
+            ) : null}
           </motion.div>
         </motion.section>
 

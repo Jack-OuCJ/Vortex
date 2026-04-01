@@ -30,6 +30,20 @@ type AccessResult =
   | { error: NextResponse; supabase: null }
   | { error: null; supabase: Awaited<ReturnType<typeof createClient>> };
 
+const touchProjectActivity = async (
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  projectId: string
+) => {
+  const { error } = await supabase
+    .from("projects")
+    .update({ updated_at: new Date().toISOString() })
+    .eq("id", projectId);
+
+  if (error) {
+    console.error("Failed to touch project activity", projectId, error.message);
+  }
+};
+
 const ensureProjectAccess = async (projectId: string): Promise<AccessResult> => {
   const supabase = await createClient();
   const {
@@ -207,6 +221,10 @@ export async function PUT(req: Request, context: RouteContext) {
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
+  }
+
+  if (rowsToUpsert.length || deletedPaths.length) {
+    await touchProjectActivity(access.supabase, id);
   }
 
   const updatedPaths = rowsToUpsert.map((row) => row.path);

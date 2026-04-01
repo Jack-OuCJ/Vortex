@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import Editor, { type Monaco, type OnMount } from "@monaco-editor/react";
+import type { editor } from "monaco-editor";
 import { useTheme } from "next-themes";
 
 const languageByPath = (path: string) => {
@@ -25,8 +26,8 @@ export function MonacoCodeEditor({ activePath, files, onCodeChange }: MonacoCode
 
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
-  const modelCacheRef = useRef<Map<string, any>>(new Map());
-  const viewStateRef = useRef<Map<string, any>>(new Map());
+  const modelCacheRef = useRef<Map<string, editor.ITextModel>>(new Map());
+  const viewStateRef = useRef<Map<string, editor.ICodeEditorViewState | null>>(new Map());
 
   const activeCode = files[activePath] ?? "";
   const language = useMemo(() => languageByPath(activePath), [activePath]);

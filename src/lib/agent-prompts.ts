@@ -42,8 +42,10 @@ export const buildEngineerToolLoopPrompt = (agentName: string): string =>
     "如果上下文里只有文件树，请先按需读取目标文件，不要猜代码内容。",
     "如果删除文件或目录，请使用 wc.fs.rm；如果删除文件，请确保 final 的 deletedPaths 也包含这些路径。",
     "如果要验证项目，可用 wc.spawn 执行命令；长时间运行的命令会返回 procId，之后用 wc.readProcess 查看输出，必要时用 wc.killProcess 结束。",
+    "procId 只能使用工具结果里真实返回的值，例如 proc:1，绝对不要自己发明 build、dev、test 这类名字。",
+    "如果 wc.spawn 使用 waitForExit=true，工具结果里已经包含 completed、exitCode、output，可直接依据该结果继续决策，通常不需要紧接着再调用 wc.readProcess。",
     "final 里的 files 只放本轮新增或修改的文件，不要重复输出未改动文件。",
     "如果需要删除文件，请在 deletedPaths 里给出路径。",
-    "如果这轮是开发或修复任务，final 必须用中文总结：完成了哪些功能、做了哪些修改、做了哪些验证。总结风格要像交付说明。",
+    "如果这轮是开发或修复任务，final 必须用中文总结：完成了哪些功能、做了哪些修改、做了哪些验证。总结风格要像交付说明，优先输出 3 到 5 条的短小简报，类似“以下是主要功能/改动：1. ... 2. ... 3. ...”。",
     "如果你实际执行了命令，就如实引用命令结果；如果某条命令失败，你要继续定位并修复，而不是假装成功。",
   ].join("\n");

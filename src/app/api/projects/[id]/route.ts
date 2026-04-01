@@ -25,6 +25,7 @@ export async function GET(_req: Request, context: RouteContext) {
     .from("projects")
     .select("id, name, created_at, updated_at")
     .eq("id", id)
+    .eq("user_id", user.id)
     .maybeSingle();
 
   if (error) {
@@ -60,6 +61,7 @@ export async function PATCH(req: Request, context: RouteContext) {
     .from("projects")
     .update({ name: parsed.data.name })
     .eq("id", id)
+    .eq("user_id", user.id)
     .select("id, name, created_at, updated_at")
     .maybeSingle();
 
@@ -85,7 +87,7 @@ export async function DELETE(_req: Request, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { error } = await supabase.from("projects").delete().eq("id", id);
+  const { error } = await supabase.from("projects").delete().eq("id", id).eq("user_id", user.id);
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

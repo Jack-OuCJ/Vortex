@@ -7,8 +7,10 @@ import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { MonacoCodeEditor } from "@/components/MonacoCodeEditor";
+import { WorkflowAccordion } from "@/components/WorkflowAccordion";
 import { useWebContainer } from "@/hooks/useWebContainer";
 import { AGENT_AVATAR_MAP, AGENT_ROLE_LABEL_MAP } from "@/lib/agent-meta";
+import { formatWorkflowToolTitle } from "@/lib/workflow";
 import { useChatStore } from "@/stores/chatStore";
 import { useProjectStore } from "@/stores/projectStore";
 import { useUiStore } from "@/stores/uiStore";
@@ -26,6 +28,7 @@ type ProjectFile = {
 };
 
 type FileSyncResponse = {
+  error?: string;
   fileTimestamps?: Array<{ path: string; updated_at: string }>;
   deletedPaths?: string[];
   conflicts?: Array<{
@@ -44,6 +47,7 @@ type AgentStreamEvent = {
   content?: string;
   projectFiles?: Array<{ path: string; code: string }>;
   fileTimestamps?: Array<{ path: string; updated_at: string }>;
+  isFinalSnapshot?: boolean;
 };
 
 type SessionStreamEvent = {
@@ -82,12 +86,7 @@ type WebContainerRequestStreamEvent = {
   request: WebContainerBridgeRequest;
 };
 
-type ProjectRenameStreamEvent = {
-  eventType: "project_rename";
-  projectName: string;
-};
-
-type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent | ProjectRenameStreamEvent | WebContainerRequestStreamEvent;
+type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent | WebContainerRequestStreamEvent;
 
 const isThinkingOrStreaming = (status?: "thinking" | "done" | "error" | "streaming") =>
   status === "thinking" || status === "streaming";
@@ -122,7 +121,6 @@ export function WorkbenchContent() {
     conflictCandidates,
     activeFilePath,
     setProjectMeta,
-    setProjectName,
     setSessionId,
     setIsBootstrapping,
     setRemoteFiles,
@@ -149,14 +147,12 @@ export function WorkbenchContent() {
 
   const [nowTs, setNowTs] = useState<number | null>(null);
   const [previewRefreshSeed, setPreviewRefreshSeed] = useState(0);
-  const [isCopyingShareLink, setIsCopyingShareLink] = useState(false);
   
   const abortControllerRef = useRef<AbortController | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const lastManualEditAtRef = useRef<Record<string, number>>({});
   const dirtyFilePathsRef = useRef<Set<string>>(new Set());
   const autoPromptConsumedRef = useRef(false);
-  const nextSendIsNewProjectRef = useRef(false);
 
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -298,6 +294,7 @@ export function WorkbenchContent() {
       if (!projectId) {
         return {
           ok: false,
+          error: "项目尚未初始化",
           updatedCount: 0,
           conflictCount: 0,
           updatedPaths: [] as string[],
@@ -336,9 +333,20 @@ export function WorkbenchContent() {
       });
 
       const isConflict = response.status === 409;
+      let payload: FileSyncResponse | null = null;
+
+      try {
+        payload = (await response.json()) as FileSyncResponse;
+      } catch {
+        payload = null;
+      }
+
       if (!response.ok && !isConflict) {
         return {
           ok: false,
+          error:
+            payload?.error ||
+            `文件同步失败（HTTP ${response.status}）`,
           updatedCount: 0,
           conflictCount: 0,
           updatedPaths: [] as string[],
@@ -347,7 +355,17 @@ export function WorkbenchContent() {
         };
       }
 
-      const payload = (await response.json()) as FileSyncResponse;
+      if (!payload) {
+        return {
+          ok: false,
+          error: "文件同步失败，服务端未返回有效结果",
+          updatedCount: 0,
+          conflictCount: 0,
+          updatedPaths: [] as string[],
+          deletedPaths: [] as string[],
+          conflictPaths: [] as string[],
+        };
+      }
 
       if (Array.isArray(payload.fileTimestamps) && payload.fileTimestamps.length) {
         setFileTimestamps(payload.fileTimestamps);
@@ -383,6 +401,7 @@ export function WorkbenchContent() {
 
       return {
         ok: true,
+        error: undefined,
         updatedCount: payload.fileTimestamps?.length ?? 0,
         conflictCount: payload.conflicts?.length ?? 0,
         updatedPaths: payload.fileTimestamps?.map((row) => row.path) ?? [],
@@ -436,33 +455,60 @@ export function WorkbenchContent() {
       try {
         if (!mounted) return;
 
+        const isNewProjectFlow = searchParams.get("newProject") === "true";
+        const targetProjectId = searchParams.get("project_id");
+
+        console.log("[bootstrap] 开始 bootstrapProject", {
+          isNewProjectFlow,
+          targetProjectId,
+          currentProjectId: projectId,
+          searchParamsKey,
+        });
+
+        if (!isNewProjectFlow && targetProjectId && projectId === targetProjectId) {
+          console.log("[bootstrap] 早返回：projectId 与 targetProjectId 相同，跳过重载", targetProjectId);
+          return;
+        }
+
         setIsBootstrapping(true);
         resetMessages();
+        resetSteps();
         setSessionId(null);
 
         // newProject=true means user came from homepage with a fresh prompt — always create a new project
-        const isNewProjectFlow = searchParams.get("newProject") === "true";
         // project_id means user explicitly clicked a project to open
-        const targetProjectId = searchParams.get("project_id");
 
         let activeProject: ProjectSummary | undefined;
 
         if (targetProjectId) {
           // Load the specific project the user clicked
+          console.log("[bootstrap] 通过 URL project_id 加载项目:", targetProjectId);
           resetMessages();
           const projectRes = await fetch(`/api/projects/${targetProjectId}`, { method: "GET" });
-          if (projectRes.ok) {
-            const projectJson = (await projectRes.json()) as { project?: ProjectSummary };
-            activeProject = projectJson.project;
+          if (!projectRes.ok) {
+            console.error("Failed to load target project", targetProjectId, projectRes.status);
+            return;
+          }
+
+          const projectJson = (await projectRes.json()) as { project?: ProjectSummary };
+          activeProject = projectJson.project;
+          console.log("[bootstrap] 项目详情加载结果:", activeProject ? "成功" : "payload 中无 project 字段");
+
+          if (!activeProject) {
+            console.error("Target project payload missing project", targetProjectId);
+            return;
           }
         } else if (!isNewProjectFlow) {
+          console.log("[bootstrap] 无 project_id，加载项目列表取第一个");
           const listRes = await fetch("/api/projects", { method: "GET" });
           if (!listRes.ok) {
+            console.error("[bootstrap] 项目列表加载失败", listRes.status);
             return;
           }
 
           const listJson = (await listRes.json()) as { projects?: ProjectSummary[] };
           activeProject = listJson.projects?.[0];
+          console.log("[bootstrap] 项目列表第一个:", activeProject?.id ?? "无项目");
         }
 
         if (!activeProject) {
@@ -482,18 +528,25 @@ export function WorkbenchContent() {
 
         if (!activeProject || !mounted) return;
 
-        setProjectMeta(activeProject.id, activeProject.name);
+        console.log("[bootstrap] 活跃项目已确定，开始加载文件和会话", { projectId: activeProject.id, projectName: activeProject.name });
+        // 注意：setProjectMeta 被移到所有异步加载完成后再调用。
+        // 原因：setProjectMeta 会更新 projectId (store)，而 projectId 是本 useEffect 的依赖，
+        // 这会导致 effect 在 async 期间触发清理（mounted = false），使后续 loadHistory / setRemoteFiles 被跳过。
 
         const [filesRes, sessionsRes] = await Promise.all([
           fetch(`/api/projects/${activeProject.id}/files`, { method: "GET" }),
           fetch(`/api/projects/${activeProject.id}/sessions`, { method: "GET" }),
         ]);
 
+        console.log("[bootstrap] files 响应状态:", filesRes.status, "sessions 响应状态:", sessionsRes.status);
+
         if (!filesRes.ok) {
+          console.error("[bootstrap] 文件加载失败", filesRes.status, await filesRes.text());
           return;
         }
 
         const filesJson = (await filesRes.json()) as { files?: ProjectFile[] };
+        console.log("[bootstrap] 文件加载完成，文件数:", filesJson.files?.length ?? 0);
         if (!mounted) return;
         setRemoteFiles(filesJson.files ?? []);
 
@@ -507,11 +560,21 @@ export function WorkbenchContent() {
               content: string;
               status: "thinking" | "streaming" | "done" | "stopped" | "error";
               created_at: string;
+              steps?: unknown;
             }>;
           };
+          console.log("[bootstrap] 会话加载完成", { sessionId: sessionsJson.session?.id, messagesCount: sessionsJson.messages?.length ?? 0 });
           if (!mounted) return;
           setSessionId(sessionsJson.session?.id ?? null);
           loadHistory(sessionsJson.messages ?? []);
+        } else {
+          console.error("[bootstrap] 会话加载失败", sessionsRes.status, await sessionsRes.text());
+        }
+
+        // 所有异步加载完成后才设置 projectId，避免提前触发 useEffect 清理导致 mounted=false
+        if (mounted) {
+          console.log("[bootstrap] 所有数据加载完成，设置 projectMeta", { id: activeProject.id, name: activeProject.name });
+          setProjectMeta(activeProject.id, activeProject.name);
         }
       } catch (error) {
         console.error("Failed to bootstrap project", error);
@@ -530,8 +593,10 @@ export function WorkbenchContent() {
   }, [
     loadHistory,
     resetMessages,
+    resetSteps,
     searchParams,
     searchParamsKey,
+    projectId,
     setIsBootstrapping,
     setProjectMeta,
     setRemoteFiles,
@@ -601,25 +666,13 @@ export function WorkbenchContent() {
     void syncFiles(projectFiles);
   }, [isBootstrapping, isContainerReady, projectFiles, syncFiles]);
 
-  // 首页 prompt 跳转后自动触发：等容器就绪 + bootstrap 完成后，一次性消费 URL 中的 prompt 参数
-  useEffect(() => {
-    if (isBootstrapping || !isContainerReady || autoPromptConsumedRef.current) return;
+  const sendMessage = useCallback(async (
+    rawMessage: string,
+    options?: { isNewProject?: boolean; clearInput?: boolean }
+  ) => {
+    const userMsg = rawMessage.trim();
+    if (!userMsg || isGenerating) return;
 
-    const initialPrompt = searchParams.get("prompt");
-    if (!initialPrompt) return;
-
-    autoPromptConsumedRef.current = true;
-    if (searchParams.get("newProject") === "true") {
-      nextSendIsNewProjectRef.current = true;
-    }
-    setInputValue(initialPrompt);
-    // 清除 URL 参数，避免刷新页面重复触发
-    router.replace("/workbench");
-  }, [isBootstrapping, isContainerReady, router, searchParams, setInputValue]);
-
-  const handleSend = async () => {
-    if (!inputValue.trim() || isGenerating) return;
-    const userMsg = inputValue.trim();
     const now = Date.now();
 
     appendMessage({
@@ -630,7 +683,9 @@ export function WorkbenchContent() {
       timestamp: Date.now(),
     });
     resetSteps();
-    setInputValue("");
+    if (options?.clearInput !== false) {
+      setInputValue("");
+    }
     
     setIsGenerating(true);
     abortControllerRef.current = new AbortController();
@@ -667,9 +722,6 @@ export function WorkbenchContent() {
           };
         });
 
-      const isNewProject = nextSendIsNewProjectRef.current;
-      nextSendIsNewProjectRef.current = false;
-
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -679,7 +731,7 @@ export function WorkbenchContent() {
           fileTree,
           projectId,
           sessionId,
-          isNewProject,
+          isNewProject: options?.isNewProject === true,
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -709,32 +761,20 @@ export function WorkbenchContent() {
                 continue;
               }
 
-              if (data.eventType === "project_rename") {
-                const newName = data.projectName;
-                setProjectName(newName);
-                if (projectId) {
-                  void fetch(`/api/projects/${projectId}`, {
-                    method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ name: newName }),
-                  }).catch(() => {/* best-effort rename */});
-                }
-                continue;
-              }
-
               if (data.eventType === "step") {
                 upsertStep({
                   id: data.stepId,
                   title: data.title,
                   status: data.status,
                   detail: data.detail,
+                  source: "step",
                 });
                 continue;
               }
 
               if (data.eventType === "tool") {
                 const stepId = `tool:${data.callId}`;
-                const title = `工具: ${data.toolName}`;
+                const title = formatWorkflowToolTitle(data.toolName);
 
                 if (data.action === "tool_start" || data.action === "tool_input_delta") {
                   upsertStep({
@@ -742,6 +782,8 @@ export function WorkbenchContent() {
                     title,
                     status: "running",
                     detail: data.detail,
+                    source: "tool",
+                    toolName: data.toolName,
                   });
                 }
 
@@ -751,6 +793,8 @@ export function WorkbenchContent() {
                     title,
                     status: "done",
                     detail: data.detail,
+                    source: "tool",
+                    toolName: data.toolName,
                   });
                 }
 
@@ -760,6 +804,8 @@ export function WorkbenchContent() {
                     title,
                     status: "error",
                     detail: data.detail,
+                    source: "tool",
+                    toolName: data.toolName,
                   });
                 }
 
@@ -767,14 +813,6 @@ export function WorkbenchContent() {
               }
 
               if (data.eventType === "webcontainer_request") {
-                const stepId = `wc:${data.request.requestId}`;
-                upsertStep({
-                  id: stepId,
-                  title: `WebContainer: ${data.request.toolName}`,
-                  status: "running",
-                  detail: "浏览器容器正在执行请求",
-                });
-
                 void executeWebContainerRequest(data.request)
                   .then(async (result) => {
                     await fetch("/api/webcontainer-bridge", {
@@ -785,21 +823,9 @@ export function WorkbenchContent() {
                         result,
                       }),
                     });
-
-                    upsertStep({
-                      id: stepId,
-                      title: `WebContainer: ${data.request.toolName}`,
-                      status: result.ok ? "done" : "error",
-                      detail: result.ok ? result.detail : result.error,
-                    });
                   })
-                  .catch((error: unknown) => {
-                    upsertStep({
-                      id: stepId,
-                      title: `WebContainer: ${data.request.toolName}`,
-                      status: "error",
-                      detail: error instanceof Error ? error.message : "WebContainer 请求失败",
-                    });
+                  .catch(() => {
+                    // 后端会通过 tool_error 事件回传失败状态。
                   });
 
                 continue;
@@ -821,8 +847,7 @@ export function WorkbenchContent() {
               const generatedFiles = agentData.projectFiles;
               if (generatedFiles && Array.isArray(generatedFiles)) {
                 const now = Date.now();
-                const isFinalEngineerSnapshot =
-                  agentData.agent === "engineer" && agentData.status === "done";
+                const isFinalEngineerSnapshot = agentData.isFinalSnapshot === true;
                 const safeFiles = generatedFiles.filter((f) => {
                   const lastEditAt = lastManualEditAtRef.current[f.path] ?? 0;
                   const isRecentlyEdited = now - lastEditAt < 1500;
@@ -924,7 +949,7 @@ export function WorkbenchContent() {
                         status: syncResult.ok ? "done" : "error",
                         detail: syncResult.ok
                           ? `已同步 ${syncPaths.length} 个 Agent 变更到数据库`
-                          : "同步数据库失败，请稍后重试",
+                          : syncResult.error || "同步数据库失败，请稍后重试",
                       });
                     })
                     .catch((err: unknown) => {
@@ -960,6 +985,53 @@ export function WorkbenchContent() {
       setIsGenerating(false);
       abortControllerRef.current = null;
     }
+  }, [
+    activeFilePath,
+    appendMessage,
+    executeWebContainerRequest,
+    isGenerating,
+    markDirtyPaths,
+    messages,
+    projectFiles,
+    projectId,
+    removeFiles,
+    resetSteps,
+    sessionId,
+    setFileTimestamps,
+    setInputValue,
+    setIsGenerating,
+    setSessionId,
+    syncProjectFilesToServer,
+    updateLastAgentMessage,
+    upsertAgentMessage,
+    upsertFiles,
+    upsertStep,
+    writeFile,
+  ]);
+
+  // 首页 prompt 跳转后自动触发：等容器就绪 + bootstrap 完成后，一次性消费 URL 中的 prompt 参数并直接发送
+  useEffect(() => {
+    if (isBootstrapping || !isContainerReady || !projectId || autoPromptConsumedRef.current) {
+      return;
+    }
+
+    const initialPrompt = searchParams.get("prompt")?.trim();
+    if (!initialPrompt) {
+      return;
+    }
+
+    autoPromptConsumedRef.current = true;
+    void sendMessage(initialPrompt, {
+      isNewProject: searchParams.get("newProject") === "true",
+      clearInput: true,
+    });
+
+    // 清除临时 prompt 参数，但保留当前项目 id，避免 bootstrap 重置会话
+    router.replace(`/workbench?project_id=${projectId}`);
+  }, [isBootstrapping, isContainerReady, projectId, router, searchParams, sendMessage]);
+
+  const handleSend = async () => {
+    await sendMessage(inputValue, { clearInput: true });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1008,47 +1080,6 @@ export function WorkbenchContent() {
     setPreviewRefreshSeed((prev) => prev + 1);
   };
 
-  const handleCopyShareLink = async () => {
-    if (!projectId || isCopyingShareLink) {
-      return;
-    }
-
-    setIsCopyingShareLink(true);
-    try {
-      const patchRes = await fetch(`/api/projects/${projectId}/share`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ isPublic: true }),
-      });
-
-      if (!patchRes.ok) {
-        throw new Error(`Failed to enable sharing (${patchRes.status})`);
-      }
-
-      const patchJson = (await patchRes.json()) as { shareUrl?: string };
-      if (!patchJson.shareUrl) {
-        throw new Error("Missing share URL");
-      }
-
-      await navigator.clipboard.writeText(patchJson.shareUrl);
-      upsertStep({
-        id: "share-link",
-        title: "分享链接",
-        status: "done",
-        detail: "分享链接已复制到剪贴板",
-      });
-    } catch (error) {
-      upsertStep({
-        id: "share-link",
-        title: "分享链接",
-        status: "error",
-        detail: error instanceof Error ? error.message : "复制分享链接失败",
-      });
-    } finally {
-      setIsCopyingShareLink(false);
-    }
-  };
-
   const handleApplyMergedCandidate = (path: string) => {
     const candidate = conflictCandidates[path];
     if (!candidate) return;
@@ -1094,6 +1125,9 @@ export function WorkbenchContent() {
   };
 
   const conflictList = Object.values(conflictCandidates);
+  const latestAgentMessageIndex = messages.reduce((latestIndex, message, index) => {
+    return message.agent === "user" ? latestIndex : index;
+  }, -1);
 
   return (
     <div className="flex w-full h-screen bg-background text-foreground font-sans overflow-hidden">
@@ -1122,32 +1156,6 @@ export function WorkbenchContent() {
         <div className="px-6 pb-2 text-xs text-muted-foreground/70 truncate">
           {projectName}
         </div>
-
-        {!!steps.length && (
-          <div className="px-6 pb-3 space-y-2">
-            {steps.map((step) => (
-              <div key={step.id} className="rounded-lg border border-border/50 bg-background/60 p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs text-foreground/90">{step.title}</span>
-                  <span
-                    className={`text-[10px] px-2 py-0.5 rounded-full ${
-                      step.status === "running"
-                        ? "bg-blue-500/20 text-blue-300"
-                        : step.status === "done"
-                          ? "bg-emerald-500/20 text-emerald-300"
-                          : "bg-red-500/20 text-red-300"
-                    }`}
-                  >
-                    {step.status}
-                  </span>
-                </div>
-                {step.detail && (
-                  <p className="text-[11px] text-muted-foreground mt-1">{step.detail}</p>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
 
         {!!conflictList.length && (
           <div className="px-6 pb-3 space-y-2">
@@ -1224,6 +1232,13 @@ export function WorkbenchContent() {
                       />
                     </div>
                     <div className="flex-1">
+                      {(() => {
+                        const workflowSteps = idx === latestAgentMessageIndex && steps.length
+                          ? steps
+                          : msg.workflowSteps ?? [];
+
+                        return (
+                          <>
                       <div className="flex items-baseline gap-2 mb-1">
                         <span className="text-sm font-semibold text-foreground/80">{msg.name}</span>
                         <span className="text-muted-foreground/40 text-xs">|</span>
@@ -1234,9 +1249,13 @@ export function WorkbenchContent() {
                           {timeStr}
                         </span>
                       </div>
+                      <WorkflowAccordion steps={workflowSteps} />
                       <div className={`text-sm text-foreground/90 leading-relaxed bg-background p-4 rounded-2xl rounded-tl-none border border-border/60 shadow-sm mt-2 ${msg.status === 'thinking' ? 'animate-pulse' : ''} ${msg.status === 'streaming' ? 'border-primary/50 bg-muted/20' : ''}`}>
                         {msg.content}
                       </div>
+                          </>
+                        );
+                      })()}
                     </div>
                   </div>
                 )}
@@ -1291,8 +1310,6 @@ export function WorkbenchContent() {
           activeTab={activeTab}
           setActiveTab={setActiveTab}
           onRefreshPreview={handleRefreshPreview}
-          onCopyShareLink={handleCopyShareLink}
-          isCopyingShareLink={isCopyingShareLink}
         />
 
         <div className="flex-1 overflow-hidden relative px-6 pb-4 mt-2">
@@ -1359,14 +1376,10 @@ function WorkbenchHeader({
   activeTab,
   setActiveTab,
   onRefreshPreview,
-  onCopyShareLink,
-  isCopyingShareLink,
 }: {
   activeTab: "preview" | "code";
   setActiveTab: (tab: "preview" | "code") => void;
   onRefreshPreview: () => void;
-  onCopyShareLink: () => void;
-  isCopyingShareLink: boolean;
 }) {
   return (
     <div className="flex items-center justify-between px-6 shrink-0 z-10">
@@ -1419,14 +1432,6 @@ function WorkbenchHeader({
       </div>
 
       <div className="flex items-center gap-2">
-        <button
-          onClick={onCopyShareLink}
-          className="rounded-lg px-2.5 h-7 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-          title="复制分享预览链接"
-          disabled={isCopyingShareLink}
-        >
-          {isCopyingShareLink ? "处理中..." : "复制分享链接"}
-        </button>
         <button
           onClick={onRefreshPreview}
           className="rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors flex items-center justify-center h-7 w-7"

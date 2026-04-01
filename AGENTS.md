@@ -42,7 +42,7 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 
 前端沙箱渲染： Sandpack 接收这个 JSONB 数据，在浏览器中实时安装依赖（如 Lucide-React, Tailwind），并热更新渲染界面。
 
-无服务器的即时分享 (Instant Preview)： 利用 Next.js 的动态路由（如 /preview/[id]），读取数据库中的文件树，并渲染一个隐藏了所有代码编辑器的“纯净版”全屏 Sandpack。这实现了物理级别免部署的“秒级在线访问链接”。
+无服务器的预览运行时：利用 Next.js 工作台与浏览器内沙箱渲染数据库中的文件树，提供项目预览；当前版本未暴露公开分享链接入口。
 
 # 四、 数据安全与用户鉴权 (Data & Auth Strategy)
 
@@ -50,7 +50,7 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 
 无密码登录： 采用邮箱 Magic Link 或 Google OAuth 授权，满足流畅的初始注册体验。
 
-行级安全 (RLS)： 数据库层面设置策略，确保用户生成的项目代码和对话历史彼此绝对隔离，只能自己查看和修改（分享预览链接除外）。
+行级安全 (RLS)： 数据库层面设置策略，确保用户生成的项目代码和对话历史彼此绝对隔离，只能自己查看和修改。
 
 状态注入 (State Injection) 代替全量记忆： 在多轮迭代对话中，后端不携带冗长的废话历史，而是直接将当前沙箱的“最新代码快照 (JSON)”作为上下文传给 AI，实现精准的“增量修改”。
 
@@ -130,6 +130,7 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 	- `agent_name text`
 	- `agent_role text`
 	- `content text not null default ''`
+	- `steps jsonb not null default '[]'::jsonb`
 	- `status text not null default 'thinking' check (status in ('thinking', 'streaming', 'done', 'stopped', 'error'))`
 	- `created_at timestamptz not null default now()`
 	- `updated_at timestamptz not null default now()`
@@ -146,10 +147,13 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 - `profiles` 通过触发器 `set_profiles_updated_at`（函数 `public.set_profile_updated_at()`）在更新时自动刷新 `updated_at`。
 - 工程师/调试节点产出文件后，后端必须在同一轮流程中对 `project_files` 执行增量 upsert（仅写入有改动的文件），不得仅依赖前端防抖保存。
 - 产出文件落库后，需将最新 `updated_at` 回传前端并刷新本地时间戳，避免后续编辑出现伪冲突或持久化延迟。
+- 当前产品未提供显式 session 切换器，因此同一项目默认只复用一个活跃会话；后端在缺少 `sessionId` 时必须优先复用该项目最近活跃的 `chat_sessions`，不得无条件新建额外 session。
 - 前端字段读取契约：
 	- 用户资料：`profiles(email, username, avatar_url)`。
 	- 项目列表：`projects(id, name, updated_at, is_public, share_token)`。
-	- 会话消息：`chat_messages(role, agent_name, agent_role, content, status, created_at)`。
+	- 会话消息：`chat_messages(role, agent_name, agent_role, content, steps, status, created_at)`。
+
+- 当前产品不暴露“复制分享链接”入口；`projects.is_public` 与 `projects.share_token` 仅作为历史兼容字段保留，新增功能不得依赖公开无鉴权文件读取接口。
 
 ## 头像同步规则（Google OAuth）
 

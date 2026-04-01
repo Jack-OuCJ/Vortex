@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { AGENT_AVATAR_MAP, AGENT_DISPLAY_NAME_MAP, type AgentRole } from "@/lib/agent-meta";
+import { normalizeWorkflowSteps, type WorkflowStep } from "@/lib/workflow";
 
 export type MessageAgent = AgentRole | "user";
 
@@ -10,17 +11,10 @@ export type ChatMessage = {
   content: string;
   status?: "thinking" | "done" | "error" | "streaming";
   timestamp: number;
+  workflowSteps?: WorkflowStep[];
 };
 
-const initialMessages: ChatMessage[] = [
-  {
-    agent: "engineer",
-    name: "Alex",
-    avatar: "/teams-avatar/50-engineer.png",
-    content: "我是 Alex。告诉我你想做什么；如果要开发，我会先整理任务，再改代码、修复问题并给你一份完成报告。",
-    timestamp: new Date("2026-03-31T12:30:00").getTime(),
-  },
-];
+const initialMessages: ChatMessage[] = [];
 
 type HistoryMessage = {
   role: "user" | "agent";
@@ -29,6 +23,7 @@ type HistoryMessage = {
   content: string;
   status: "thinking" | "streaming" | "done" | "stopped" | "error";
   created_at: string;
+  steps?: unknown;
 };
 
 type ChatStore = {
@@ -105,7 +100,7 @@ export const useChatStore = create<ChatStore>((set) => ({
       }
 
       const mapped: ChatMessage[] = historyMessages
-        .filter((m) => m.status !== "thinking" && m.status !== "streaming")
+        .filter((m) => m.role === "user" || m.content.trim().length > 0)
         .map((m) => {
           if (m.role === "user") {
             return {
@@ -124,8 +119,11 @@ export const useChatStore = create<ChatStore>((set) => ({
             name,
             avatar: AGENT_AVATAR_MAP[role],
             content: m.content,
-            status: (m.status === "stopped" ? "done" : m.status) as ChatMessage["status"],
+            status: (m.status === "error"
+              ? "error"
+              : "done") as ChatMessage["status"],
             timestamp: new Date(m.created_at).getTime(),
+            workflowSteps: normalizeWorkflowSteps(m.steps),
           };
         });
 

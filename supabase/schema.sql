@@ -40,10 +40,14 @@ create table if not exists public.chat_messages (
   agent_name text,
   agent_role text,
   content text not null default '',
+  steps jsonb not null default '[]'::jsonb,
   status text not null default 'thinking' check (status in ('thinking', 'streaming', 'done', 'stopped', 'error')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.chat_messages
+  add column if not exists steps jsonb not null default '[]'::jsonb;
 
 create index if not exists idx_projects_user_updated
   on public.projects(user_id, updated_at desc);
