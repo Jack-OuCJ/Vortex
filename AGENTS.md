@@ -144,6 +144,8 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 - 统一 `updated_at` 触发器函数：`public.set_updated_at_timestamp()`（`set search_path = public`）。
 - `projects / project_files / chat_sessions / chat_messages` 在更新时自动刷新 `updated_at`。
 - `profiles` 通过触发器 `set_profiles_updated_at`（函数 `public.set_profile_updated_at()`）在更新时自动刷新 `updated_at`。
+- 工程师/调试节点产出文件后，后端必须在同一轮流程中对 `project_files` 执行增量 upsert（仅写入有改动的文件），不得仅依赖前端防抖保存。
+- 产出文件落库后，需将最新 `updated_at` 回传前端并刷新本地时间戳，避免后续编辑出现伪冲突或持久化延迟。
 - 前端字段读取契约：
 	- 用户资料：`profiles(email, username, avatar_url)`。
 	- 项目列表：`projects(id, name, updated_at, is_public, share_token)`。

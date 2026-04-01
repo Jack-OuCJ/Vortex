@@ -19,6 +19,7 @@ type AgentEvent = {
   status: "thinking" | "done" | "error" | "streaming";
   content?: string;
   projectFiles?: ProjectFile[];
+  fileTimestamps?: Array<{ path: string; updated_at: string }>;
   isAppDemand?: boolean;
 };
 
@@ -125,6 +126,33 @@ const createModel = () => {
   });
 };
 
+const isLikelyMiniMax = () => {
+  const baseURL = (process.env.OPENAI_BASE_URL ?? "").toLowerCase();
+  const modelName = (process.env.OPENAI_MODEL ?? "").toLowerCase();
+  return baseURL.includes("minimax") || modelName.includes("minimax");
+};
+
+const messageContentToText = (content: unknown) => {
+  if (typeof content === "string") return content;
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content ?? "");
+  }
+};
+
+const normalizeMessagesForProvider = (messages: Array<HumanMessage | SystemMessage>) => {
+  if (!isLikelyMiniMax()) return messages;
+
+  return messages.map((msg) => {
+    if (msg instanceof SystemMessage) {
+      // MiniMax OpenAI-compatible endpoint may reject role=system.
+      return new HumanMessage(`[系统指令]\n${messageContentToText(msg.content)}`);
+    }
+    return msg;
+  });
+};
+
 const sendEvent = (
   controller: ReadableStreamDefaultController,
   encoder: TextEncoder,
@@ -140,6 +168,8 @@ type PersistContext = {
   sessionId: string | null;
   userMessage: string | null;
 };
+
+type SupabaseServerClient = Awaited<ReturnType<typeof createClient>>;
 
 const upsertAgentMessage = async (
   ctx: PersistContext,
@@ -224,6 +254,76 @@ const stringifyProjectFiles = (files: ProjectFile[]) => {
     files.map((file) => ({ path: file.path, code: file.code })),
     null,
     2
+  );
+};
+
+const hasMeaningfulFileChange = (baseline: ProjectFile[], candidate: ProjectFile[]) => {
+  if (!candidate.length) {
+    return false;
+  }
+
+  const baselineMap = new Map<string, string>();
+  baseline.forEach((file) => {
+    baselineMap.set(file.path, file.code);
+  });
+
+  return candidate.some((file) => baselineMap.get(file.path) !== file.code);
+};
+
+const persistChangedProjectFiles = async ({
+  supabase,
+  projectId,
+  baselineFiles,
+  nextFiles,
+}: {
+  supabase: SupabaseServerClient;
+  projectId?: string;
+  baselineFiles: ProjectFile[];
+  nextFiles: ProjectFile[];
+}) => {
+  if (!projectId) {
+    return [] as Array<{ path: string; updated_at: string }>;
+  }
+
+  const baselineMap = new Map<string, string>();
+  baselineFiles.forEach((file) => {
+    baselineMap.set(file.path, file.code);
+  });
+
+  const rowsToUpsert = nextFiles
+    .filter((file) => baselineMap.get(file.path) !== file.code)
+    .map((file) => ({
+      project_id: projectId,
+      path: file.path,
+      content: file.code,
+    }));
+
+  if (!rowsToUpsert.length) {
+    return [] as Array<{ path: string; updated_at: string }>;
+  }
+
+  const { error: upsertError } = await supabase
+    .from("project_files")
+    .upsert(rowsToUpsert, { onConflict: "project_id,path" });
+
+  if (upsertError) {
+    throw new Error(`持久化 project_files 失败: ${upsertError.message}`);
+  }
+
+  const changedPaths = rowsToUpsert.map((row) => row.path);
+  const { data, error: queryError } = await supabase
+    .from("project_files")
+    .select("path, updated_at")
+    .eq("project_id", projectId)
+    .in("path", changedPaths);
+
+  if (queryError) {
+    throw new Error(`读取 project_files 时间戳失败: ${queryError.message}`);
+  }
+
+  return (data ?? []).filter(
+    (row): row is { path: string; updated_at: string } =>
+      typeof row.path === "string" && typeof row.updated_at === "string"
   );
 };
 
@@ -406,10 +506,29 @@ const runFileToolLoop = async ({
     toolLoopMessages.push(new SystemMessage(`上一轮输出:\n${loopText}`));
 
     if (decision.action === "final") {
-      finalized = true;
-      projectFilesResult = decision.files.length
+      const candidateFiles = decision.files.length
         ? decision.files
         : Array.from(fileMap.entries()).map(([path, code]) => ({ path, code }));
+
+      if (!hasMeaningfulFileChange(initialFiles, candidateFiles)) {
+        sendEvent(controller, encoder, {
+          eventType: "tool",
+          callId: rootToolCallId,
+          action: "tool_input_delta",
+          toolName: rootToolName,
+          detail: "检测到 final 未包含有效代码改动，继续迭代",
+        });
+
+        toolLoopMessages.push(
+          new HumanMessage(
+            "校验失败：你提交的 final 与输入文件相比没有任何有效改动。请继续调用 read_file / write_file，并输出包含真实改动的 final。"
+          )
+        );
+        continue;
+      }
+
+      finalized = true;
+      projectFilesResult = candidateFiles;
       break;
     }
 
@@ -505,7 +624,7 @@ const invokeWithStream = async (
   agentMessageIds: Map<string, string>,
   toolContext?: { callId: string; toolName: ToolEvent["toolName"] }
 ) => {
-  const stream = await llm.stream(messages);
+  const stream = await llm.stream(normalizeMessagesForProvider(messages));
   let fullContent = "";
   let lastDeltaLength = 0;
   let lastPreview = "";
@@ -651,12 +770,45 @@ export async function POST(req: Request) {
               maxRounds: 4,
             });
 
+            const hasDebugFileChanges = hasMeaningfulFileChange(projectFiles, debugFiles);
+            let debugFileTimestamps: Array<{ path: string; updated_at: string }> = [];
+
+            if (hasDebugFileChanges) {
+              sendEvent(controller, encoder, {
+                eventType: "tool",
+                callId: debugToolCallId,
+                action: "tool_input_delta",
+                toolName: "debug_fix",
+                detail: "检测到修复改动，正在同步到 Supabase",
+              });
+
+              try {
+                debugFileTimestamps = await persistChangedProjectFiles({
+                  supabase,
+                  projectId,
+                  baselineFiles: projectFiles,
+                  nextFiles: debugFiles,
+                });
+              } catch (error) {
+                sendEvent(controller, encoder, {
+                  eventType: "tool",
+                  callId: debugToolCallId,
+                  action: "tool_error",
+                  toolName: "debug_fix",
+                  detail:
+                    error instanceof Error ? error.message : "同步修复文件到 Supabase 失败",
+                });
+              }
+            }
+
             sendEvent(controller, encoder, {
               eventType: "tool",
               callId: debugToolCallId,
               action: "tool_result",
               toolName: "debug_fix",
-              detail: `已生成 ${Array.isArray(debugFiles) ? debugFiles.length : 0} 个文件修复结果`,
+              detail: hasDebugFileChanges
+                ? `已生成并同步 ${Array.isArray(debugFiles) ? debugFiles.length : 0} 个修复文件`
+                : `已生成 ${Array.isArray(debugFiles) ? debugFiles.length : 0} 个文件修复结果`,
             });
 
             await emitEvent(controller, encoder, {
@@ -665,6 +817,7 @@ export async function POST(req: Request) {
               status: "done",
               content: "修复完成，正在更新沙箱。",
               projectFiles: debugFiles,
+              fileTimestamps: debugFileTimestamps,
             }, persistCtx, agentMessageIds);
 
             sendEvent(controller, encoder, {
@@ -713,12 +866,13 @@ export async function POST(req: Request) {
                 content: "我正在初判你的需求...",
               }, persistCtx, agentMessageIds);
 
-              const pmObj = await llm.invoke([
+              const pmMessages = normalizeMessagesForProvider([
                 new SystemMessage(
                   "分析用户的后续任务。如果对方要求建立或修改前端网页/应用，将其整理成一段简要 PRD。如果是任何其它纯文字闲聊或知识提问，不用整理。仅可输出严格的 JSON 格式:\n{ \"isAppDemand\": boolean, \"prd\": \"string\" }"
                 ),
                 new HumanMessage(`用户输入:\n${message}`)
               ]);
+              const pmObj = await llm.invoke(pmMessages);
               let result: { isAppDemand?: boolean; prd?: string; reply?: string };
               try {
                 result = parseJSONFromLLM(pmObj.content as string) as {
@@ -784,7 +938,7 @@ export async function POST(req: Request) {
                   new SystemMessage(
                     "你是产品经理 Emma。由于当前用户提出的并非实际的程序开发指令，请用随和、知识面的口语化语气给出直接解答或回应。一定不能包含任何 ```json 等代码包裹或系统分析。直接像真人打字那样聊天即可。"
                   ),
-                  new HumanMessage(message)
+                  new HumanMessage(message ?? "")
                 ],
                 "pm",
                 "Emma",
@@ -934,20 +1088,56 @@ export async function POST(req: Request) {
                 maxRounds: 4,
               });
 
+              const hasFileChanges = hasMeaningfulFileChange(projectFiles, projectFilesResult);
+              let fileTimestamps: Array<{ path: string; updated_at: string }> = [];
+
+              if (hasFileChanges) {
+                sendEvent(controller, encoder, {
+                  eventType: "tool",
+                  callId: generateToolCallId,
+                  action: "tool_input_delta",
+                  toolName: "generate_project_files",
+                  detail: "检测到代码改动，正在同步到 Supabase",
+                });
+
+                try {
+                  fileTimestamps = await persistChangedProjectFiles({
+                    supabase,
+                    projectId,
+                    baselineFiles: projectFiles,
+                    nextFiles: projectFilesResult,
+                  });
+                } catch (error) {
+                  sendEvent(controller, encoder, {
+                    eventType: "tool",
+                    callId: generateToolCallId,
+                    action: "tool_error",
+                    toolName: "generate_project_files",
+                    detail:
+                      error instanceof Error ? error.message : "同步生成文件到 Supabase 失败",
+                  });
+                }
+              }
+
               sendEvent(controller, encoder, {
                 eventType: "tool",
                 callId: generateToolCallId,
                 action: "tool_result",
                 toolName: "generate_project_files",
-                detail: `代码生成完成，产出文件: ${Array.isArray(projectFilesResult) ? projectFilesResult.length : 0}`,
+                detail: hasFileChanges
+                  ? `代码生成完成，产出文件: ${Array.isArray(projectFilesResult) ? projectFilesResult.length : 0}`
+                  : "代码生成流程结束，但未检测到有效代码改动",
               });
 
               await emitEvent(controller, encoder, {
                 agent: "engineer",
                 name: "Alex",
                 status: "done",
-                content: "代码生成完成，已准备更新沙箱。",
+                content: hasFileChanges
+                  ? "代码生成完成，已准备更新沙箱。"
+                  : "本轮生成未产出有效代码改动，请补充更具体需求后重试。",
                 projectFiles: projectFilesResult,
+                fileTimestamps,
               }, persistCtx, agentMessageIds);
 
               sendEvent(controller, encoder, {

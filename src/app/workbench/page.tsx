@@ -29,6 +29,7 @@ type AgentStreamEvent = {
   status: "thinking" | "done" | "error" | "streaming";
   content?: string;
   projectFiles?: Array<{ path: string; code: string }>;
+  fileTimestamps?: Array<{ path: string; updated_at: string }>;
 };
 
 type SessionStreamEvent = {
@@ -472,6 +473,16 @@ export function WorkbenchContent() {
 
                 if (safeFiles.length) {
                   upsertFiles(safeFiles);
+                }
+
+                const incomingTimestamps = agentData.fileTimestamps;
+                if (Array.isArray(incomingTimestamps) && incomingTimestamps.length) {
+                  const safePaths = new Set(safeFiles.map((file) => file.path));
+                  const appliedTimestamps = incomingTimestamps.filter((row) => safePaths.has(row.path));
+
+                  if (appliedTimestamps.length) {
+                    setFileTimestamps(appliedTimestamps);
+                  }
                 }
               }
             } catch {
