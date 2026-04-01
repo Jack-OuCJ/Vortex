@@ -77,8 +77,8 @@ export const normalizeWorkflowSteps = (input: unknown): WorkflowStep[] => {
         round: typeof record.round === "number" ? record.round : undefined,
         source: isWorkflowSource(record.source) ? record.source : toolName ? "tool" : "step",
         toolName,
-      } satisfies WorkflowStep;
+      } as WorkflowStep;
     })
-    .filter((step): step is WorkflowStep => Boolean(step))
+    .filter((step): step is WorkflowStep => step !== null)
     .sort((left, right) => left.updatedAt - right.updatedAt);
 };

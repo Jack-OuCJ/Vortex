@@ -75,7 +75,12 @@ type WebContainerRequestEvent = {
   request: WebContainerBridgeRequest;
 };
 
-type StreamEvent = AgentEvent | SessionEvent | StepEvent | ToolEvent | WebContainerRequestEvent;
+type ProjectRenameEvent = {
+  eventType: "project_rename";
+  name: string;
+};
+
+type StreamEvent = AgentEvent | SessionEvent | StepEvent | ToolEvent | WebContainerRequestEvent | ProjectRenameEvent;
 
 type RequestProjectFile = {
   path: string;
@@ -1913,26 +1918,27 @@ export async function POST(req: Request) {
         } catch (streamError) {
           console.error("====== AGENT STREAM ERROR ======");
           console.error(streamError);
-          sendTrackedEvent({
+          sendEvent(controller, encoder, {
             eventType: "tool",
             callId: createToolCallId("execute_task"),
             action: "tool_error",
             toolName: "execute_task",
             detail: streamError instanceof Error ? streamError.message : "未知错误",
           });
-          sendTrackedEvent({
+          sendEvent(controller, encoder, {
             eventType: "step",
             stepId: "execute",
             title: "工程执行",
             status: "error",
             detail: "流处理失败",
           });
-          await emitEvent(controller, encoder, {
+          sendEvent(controller, encoder, {
+            eventType: "agent",
             agent: "engineer",
             name: "Alex",
             status: "error",
             content: "生成失败，请稍后重试。",
-          }, persistCtx, agentMessageIds);
+          });
           controller.close();
         }
       },
