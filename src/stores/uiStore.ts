@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
-const HIDDEN_STEP_IDS = new Set(["pm", "direct_reply"]);
-const HIDDEN_STEP_TITLES = new Set(["需求分析", "直接回复", "工具: analyze_demand"]);
+const HIDDEN_STEP_IDS = new Set<string>([]);
+const HIDDEN_STEP_TITLES = new Set<string>([]);
 
 type UiStore = {
   activeTab: "preview" | "code";

@@ -1,6 +1,7 @@
 import { create } from "zustand";
+import { AGENT_AVATAR_MAP, AGENT_DISPLAY_NAME_MAP, type AgentRole } from "@/lib/agent-meta";
 
-export type MessageAgent = "pm" | "architect" | "engineer" | "debug" | "user";
+export type MessageAgent = AgentRole | "user";
 
 export type ChatMessage = {
   agent: MessageAgent;
@@ -13,20 +14,22 @@ export type ChatMessage = {
 
 const initialMessages: ChatMessage[] = [
   {
-    agent: "pm",
-    name: "Emma",
-    avatar: "/teams-avatar/pm.png",
-    content: "Hi! I am Emma, your Product Manager. What are we building today?",
-    timestamp: new Date("2026-03-29T12:00:00").getTime(),
-  },
-  {
     agent: "engineer",
     name: "Alex",
     avatar: "/teams-avatar/50-engineer.png",
-    content: "Alex here! Ready to dive into the code and build something great.",
+    content: "我是 Alex。告诉我你想做什么；如果要开发，我会先整理任务，再改代码、修复问题并给你一份完成报告。",
     timestamp: new Date("2026-03-31T12:30:00").getTime(),
   },
 ];
+
+type HistoryMessage = {
+  role: "user" | "agent";
+  agent_name: string | null;
+  agent_role: string | null;
+  content: string;
+  status: "thinking" | "streaming" | "done" | "stopped" | "error";
+  created_at: string;
+};
 
 type ChatStore = {
   inputValue: string;
@@ -37,6 +40,23 @@ type ChatStore = {
   appendMessage: (message: ChatMessage) => void;
   updateLastAgentMessage: (name: string, update: Partial<ChatMessage>) => void;
   upsertAgentMessage: (message: ChatMessage) => void;
+  loadHistory: (historyMessages: HistoryMessage[]) => void;
+  resetMessages: () => void;
+};
+
+const resolveAgentRole = (agentRole: string | null): AgentRole => {
+  switch (agentRole) {
+    case "leader":
+    case "seo":
+    case "pm":
+    case "architect":
+    case "engineer":
+    case "analyst":
+    case "researcher":
+      return agentRole;
+    default:
+      return "engineer";
+  }
 };
 
 export const useChatStore = create<ChatStore>((set) => ({
@@ -78,4 +98,38 @@ export const useChatStore = create<ChatStore>((set) => ({
       }
       return { messages: [...state.messages, message] };
     }),
+  loadHistory: (historyMessages) =>
+    set(() => {
+      if (!historyMessages.length) {
+        return { messages: initialMessages };
+      }
+
+      const mapped: ChatMessage[] = historyMessages
+        .filter((m) => m.status !== "thinking" && m.status !== "streaming")
+        .map((m) => {
+          if (m.role === "user") {
+            return {
+              agent: "user" as MessageAgent,
+              name: "You",
+              avatar: "",
+              content: m.content,
+              status: "done" as const,
+              timestamp: new Date(m.created_at).getTime(),
+            };
+          }
+          const role = resolveAgentRole(m.agent_role);
+          const name = m.agent_name ?? AGENT_DISPLAY_NAME_MAP[role] ?? "Alex";
+          return {
+            agent: role as MessageAgent,
+            name,
+            avatar: AGENT_AVATAR_MAP[role],
+            content: m.content,
+            status: (m.status === "stopped" ? "done" : m.status) as ChatMessage["status"],
+            timestamp: new Date(m.created_at).getTime(),
+          };
+        });
+
+      return { messages: mapped };
+    }),
+  resetMessages: () => set({ messages: initialMessages }),
 }));

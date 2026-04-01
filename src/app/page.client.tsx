@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, useEffect } from "react";
 import Image from "next/image";
 import { motion } from "framer-motion";
-import { Plus, ArrowRight } from "lucide-react";
+import { Plus, ArrowRight, LayoutGrid } from "lucide-react";
+import { formatDistanceToNow } from "date-fns";
+import { zhCN } from "date-fns/locale";
 import type { User } from "@supabase/supabase-js";
 import { SidebarAndHeader } from "@/components/SidebarAndHeader";
 import { useRouter } from "next/navigation";
+import { useHistoryStore } from "@/stores/historyStore";
 
 type UserProfile = {
   email: string | null;
@@ -45,11 +48,19 @@ export default function HomeClient({
   const [isSidebarPinned, setIsSidebarPinned] = useState(false);
   const router = useRouter();
 
+  const { projects, fetchProjects, isLoading } = useHistoryStore();
+
+  useEffect(() => {
+    if (user?.id) {
+      fetchProjects(user.id);
+    }
+  }, [user?.id, fetchProjects]);
+
   const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
 
   const handleSubmit = useCallback(() => {
     if (!canSubmit) return;
-    router.push(`/workbench?prompt=${encodeURIComponent(prompt.trim())}`);
+    router.push(`/workbench?prompt=${encodeURIComponent(prompt.trim())}&newProject=true`);
   }, [canSubmit, prompt, router]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -69,7 +80,7 @@ export default function HomeClient({
         onSidebarChange={setIsSidebarPinned}
       />
 
-      <main className="mx-auto flex w-full max-w-[1200px] flex-col items-center px-4 pb-14 pt-24 sm:px-6 sm:pt-32 lg:pt-36">
+      <main className="mx-auto flex w-full max-w-[1200px] flex-col items-center px-4 pt-24 sm:px-6 sm:pt-32 lg:pt-36">
         <motion.section
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -152,10 +163,70 @@ export default function HomeClient({
               </button>
             </div>
           </motion.div>
-
-
         </motion.section>
-      </main>
+
+        </main>
+
+        {user && projects.length > 0 && (
+          <div className="mx-auto w-full max-w-[2000px] px-4 pb-14 sm:px-6">
+          <motion.section
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.3, duration: 0.5 }}
+            className="mt-48 w-full"
+          >
+            <div className="rounded-2xl bg-card border border-border shadow-sm px-8 py-6">
+              <h2 className="text-lg font-semibold tracking-tight mb-6 text-card-foreground">我的项目</h2>
+
+              <div className="grid grid-cols-2 gap-6 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                {projects.map((project, idx) => (
+                  <motion.div
+                    key={project.id}
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    whileHover={{ scale: 1.02, y: -3 }}
+                    transition={{ delay: 0.05 * idx, duration: 0.3 }}
+                    onClick={() => router.push(`/workbench?project_id=${project.id}`)}
+                    className="group cursor-pointer rounded-xl p-2 -m-2 transition-colors hover:bg-muted/50"
+                  >
+                    {/* Thumbnail */}
+                    <div className="relative aspect-video w-full rounded-xl bg-muted overflow-hidden mb-3 border border-border">
+                      <div className="absolute inset-0 flex items-center justify-center text-muted-foreground/25 transition-transform duration-500 group-hover:scale-110">
+                        <LayoutGrid className="size-10" />
+                      </div>
+                    </div>
+
+                    {/* Info */}
+                    <div className="flex items-center gap-2.5">
+                      {/* Avatar */}
+                      {profile?.avatar_url ? (
+                        <div className="relative size-8 overflow-hidden rounded-full border border-border flex-shrink-0">
+                          <Image
+                            src={profile.avatar_url}
+                            alt={profile.username || "Avatar"}
+                            fill
+                            className="object-cover"
+                          />
+                        </div>
+                      ) : (
+                        <div className="size-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-sm font-semibold flex-shrink-0">
+                          {(profile?.username || "U")[0].toUpperCase()}
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold line-clamp-1 text-foreground">{project.name}</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          {formatDistanceToNow(new Date(project.created_at), { addSuffix: true, locale: zhCN })}
+                        </p>
+                      </div>
+                    </div>
+                  </motion.div>
+                ))}
+              </div>
+            </div>
+          </motion.section>
+          </div>
+        )}
     </div>
   );
 }

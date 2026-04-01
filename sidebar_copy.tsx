@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { User } from "@supabase/supabase-js";
 import {
   Atom,
@@ -268,12 +269,16 @@ export function SidebarAndHeader({
             >
               <div className="flex items-center gap-2.5 overflow-hidden">
                 {profileAvatarUrl && !avatarLoadFailed ? (
-                  <img
-                    src={profileAvatarUrl}
-                    alt={profileName}
-                    onError={() => setAvatarLoadFailed(true)}
-                    className="size-8 rounded-full object-cover flex-shrink-0 shadow-sm"
-                  />
+                  <div className="relative size-8 rounded-full overflow-hidden flex-shrink-0 shadow-sm">
+                    <Image
+                      src={profileAvatarUrl}
+                      alt={profileName}
+                      fill
+                      sizes="32px"
+                      onError={() => setAvatarLoadFailed(true)}
+                      className="object-cover"
+                    />
+                  </div>
                 ) : (
                   <div className="size-8 rounded-full bg-black flex-shrink-0 flex items-center justify-center text-white text-xs font-bold shadow-sm">
                     {avatarFallback}

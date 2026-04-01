@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { getPersistedTemplateFiles } from "@/lib/webcontainer-template";
 
 const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(120),
@@ -56,6 +57,22 @@ export async function POST(req: Request) {
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  const templateFiles = getPersistedTemplateFiles();
+  const fileRows = Object.entries(templateFiles).map(([path, content]) => ({
+    project_id: data.id,
+    path,
+    content,
+  }));
+
+  if (fileRows.length) {
+    const { error: filesError } = await supabase.from("project_files").insert(fileRows);
+
+    if (filesError) {
+      await supabase.from("projects").delete().eq("id", data.id);
+      return NextResponse.json({ error: filesError.message }, { status: 500 });
+    }
   }
 
   return NextResponse.json({ project: data }, { status: 201 });

@@ -1,138 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { WebContainer, type FileSystemTree } from "@webcontainer/api";
+import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
+import { getWebContainer } from "@/lib/webcontainer-singleton";
+import {
+  toDirectoryPath,
+  toLogicalPath,
+  toRuntimePath,
+  toRuntimeTree,
+} from "@/lib/webcontainer-template";
 
 type FilesMap = Record<string, string>;
 
-const BASE_PROJECT_FILES: FileSystemTree = {
-  "package.json": {
-    file: {
-      contents: JSON.stringify(
-        {
-          name: "atoms-runtime",
-          private: true,
-          version: "0.0.1",
-          type: "module",
-          scripts: {
-            dev: "vite --host 0.0.0.0 --port 5173",
-          },
-          dependencies: {
-            react: "^19.2.0",
-            "react-dom": "^19.2.0",
-            "framer-motion": "^12.0.0",
-            "lucide-react": "^1.0.0",
-          },
-          devDependencies: {
-            "@types/react": "^19.0.0",
-            "@types/react-dom": "^19.0.0",
-            "@vitejs/plugin-react": "^5.0.0",
-            typescript: "^5.0.0",
-            vite: "^7.0.0",
-          },
-        },
-        null,
-        2
-      ),
-    },
-  },
-  "index.html": {
-    file: {
-      contents:
-        "<!doctype html><html><head><meta charset=\"UTF-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"/><title>ATOMS Preview</title></head><body><div id=\"root\"></div><script type=\"module\" src=\"/src/main.tsx\"></script></body></html>",
-    },
-  },
-  "tsconfig.json": {
-    file: {
-      contents: JSON.stringify(
-        {
-          compilerOptions: {
-            target: "ESNext",
-            module: "ESNext",
-            lib: ["DOM", "DOM.Iterable", "ESNext"],
-            skipLibCheck: true,
-            moduleResolution: "Bundler",
-            allowImportingTsExtensions: true,
-            resolveJsonModule: true,
-            isolatedModules: true,
-            noEmit: true,
-            jsx: "react-jsx",
-            strict: true,
-          },
-          include: ["src"],
-        },
-        null,
-        2
-      ),
-    },
-  },
-  "vite.config.ts": {
-    file: {
-      contents:
-        "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n\nexport default defineConfig({ plugins: [react()] });\n",
-    },
-  },
-  src: {
-    directory: {
-      "main.tsx": {
-        file: {
-          contents:
-            "import React from 'react';\nimport { createRoot } from 'react-dom/client';\nimport './index.css';\nimport App from './App';\n\ncreateRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);\n",
-        },
-      },
-      "index.css": {
-        file: {
-          contents:
-            "html, body, #root { margin: 0; padding: 0; width: 100%; min-height: 100%; font-family: ui-sans-serif, system-ui; }\n",
-        },
-      },
-    },
-  },
+type ProcessSnapshot = {
+  procId: string;
+  output: string;
+  completed: boolean;
+  exitCode: number | null;
 };
 
-const toRuntimePath = (logicalPath: string): string => {
-  const normalized = logicalPath.startsWith("/") ? logicalPath.slice(1) : logicalPath;
-  if (normalized.startsWith("src/")) {
-    return normalized;
-  }
-  return `src/${normalized}`;
-};
-
-const toRuntimeTree = (files: FilesMap): FileSystemTree => {
-  const srcEntries: Record<string, { file: { contents: string } }> = {};
-
-  for (const [logicalPath, content] of Object.entries(files)) {
-    const runtimePath = toRuntimePath(logicalPath);
-    const cleaned = runtimePath.replace(/^src\//, "");
-    srcEntries[cleaned] = { file: { contents: content } };
-  }
-
-  if (!srcEntries["App.tsx"]) {
-    srcEntries["App.tsx"] = {
-      file: {
-        contents:
-          "export default function App() { return <div style={{padding:20}}>Hello from ATOMS runtime</div>; }",
-      },
-    };
-  }
-
-  return {
-    ...BASE_PROJECT_FILES,
-    src: {
-      directory: {
-        ...(BASE_PROJECT_FILES.src as { directory: Record<string, { file: { contents: string } }> }).directory,
-        ...srcEntries,
-      },
-    },
-  };
-};
-
-const toDirectoryPath = (runtimePath: string): string => {
-  const index = runtimePath.lastIndexOf("/");
-  if (index <= 0) {
-    return "";
-  }
-  return runtimePath.slice(0, index);
+type ManagedProcess = {
+  process: WebContainerProcess;
+  output: string[];
+  completed: boolean;
+  exitCode: number | null;
 };
 
 // Strip ANSI/control sequences so terminal logs render as readable plain text.
@@ -162,17 +53,17 @@ export function useWebContainer() {
   const startingRef = useRef<Promise<void> | null>(null);
   const syncedFilesRef = useRef<FilesMap>({});
   const logBufferRef = useRef("");
+  const processCounterRef = useRef(0);
+  const processesRef = useRef<Map<string, ManagedProcess>>(new Map());
 
   useEffect(() => {
     let mounted = true;
 
     const boot = async () => {
       try {
-        const wc = await WebContainer.boot();
-        if (!mounted) {
-          wc.teardown();
-          return;
-        }
+        // 使用单例：多次挂载组件时 boot 只发生一次
+        const wc = await getWebContainer();
+        if (!mounted) return;
 
         wcRef.current = wc;
         wc.on("server-ready", (_port, url) => {
@@ -180,7 +71,9 @@ export function useWebContainer() {
         });
         setIsReady(true);
       } catch (error) {
-        setLogs((prev) => [...prev, `WebContainer boot failed: ${String(error)}`]);
+        if (mounted) {
+          setLogs((prev) => [...prev, `WebContainer boot failed: ${String(error)}`]);
+        }
       }
     };
 
@@ -188,9 +81,7 @@ export function useWebContainer() {
 
     return () => {
       mounted = false;
-      if (wcRef.current) {
-        wcRef.current.teardown();
-      }
+      // 不调用 teardown()：单例必须常驻，teardown 会销毁全局实例
       wcRef.current = null;
     };
   }, []);
@@ -213,6 +104,116 @@ export function useWebContainer() {
     }
   }, []);
 
+  const registerProcess = useCallback((process: WebContainerProcess, initialLine: string) => {
+    const procId = `proc:${++processCounterRef.current}`;
+    const managed: ManagedProcess = {
+      process,
+      output: initialLine ? [initialLine] : [],
+      completed: false,
+      exitCode: null,
+    };
+
+    processesRef.current.set(procId, managed);
+
+    void process.output.pipeTo(
+      new WritableStream({
+        write(data) {
+          const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
+          const sanitized = stripTerminalControlCodes(raw);
+          if (!sanitized) {
+            return;
+          }
+
+          const current = processesRef.current.get(procId);
+          if (!current) {
+            return;
+          }
+
+          current.output.push(sanitized);
+          if (current.output.length > 200) {
+            current.output = current.output.slice(-200);
+          }
+          appendLog(sanitized);
+        },
+      })
+    );
+
+    void process.exit.then((exitCode) => {
+      const current = processesRef.current.get(procId);
+      if (!current) {
+        return;
+      }
+
+      current.completed = true;
+      current.exitCode = exitCode;
+    });
+
+    return procId;
+  }, [appendLog]);
+
+  const ensureStarted = useCallback(async () => {
+    const wc = wcRef.current;
+    if (!wc || !isReady) {
+      throw new Error("WebContainer 尚未就绪");
+    }
+
+    if (startedRef.current) {
+      return wc;
+    }
+
+    if (!startingRef.current) {
+      startingRef.current = (async () => {
+        const tree = toRuntimeTree(syncedFilesRef.current);
+        await wc.mount(tree);
+
+        appendLog("[runtime] Installing dependencies...");
+        const installProc = await wc.spawn("npm", ["install"]);
+        void installProc.output.pipeTo(
+          new WritableStream({
+            write(data) {
+              appendLog(data);
+            },
+          })
+        );
+        const installExit = await installProc.exit;
+        if (installExit !== 0) {
+          throw new Error(`npm install failed with exit code ${installExit}`);
+        }
+
+        appendLog("[runtime] Starting dev server...");
+        const devProc = await wc.spawn("npm", ["run", "dev"]);
+        registerProcess(devProc, "[runtime] npm run dev started");
+
+        startedRef.current = true;
+      })()
+        .catch((error) => {
+          appendLog(`[runtime] Startup failed: ${String(error)}`);
+          startedRef.current = false;
+          throw error;
+        })
+        .finally(() => {
+          startingRef.current = null;
+        });
+    }
+
+    await startingRef.current;
+    return wc;
+  }, [appendLog, isReady, registerProcess]);
+
+  const getProcessSnapshot = useCallback((procId: string): ProcessSnapshot | null => {
+    const managed = processesRef.current.get(procId);
+    if (!managed) {
+      return null;
+    }
+
+    return {
+      procId,
+      output: managed.output.join("\n").trim(),
+      completed: managed.completed,
+      exitCode: managed.exitCode,
+    };
+  }, []);
+
   const syncFiles = useCallback(
     async (files: FilesMap) => {
       const wc = wcRef.current;
@@ -221,49 +222,9 @@ export function useWebContainer() {
       }
 
       if (!startedRef.current) {
-        if (!startingRef.current) {
-          startingRef.current = (async () => {
-            const tree = toRuntimeTree(files);
-            await wc.mount(tree);
-
-            appendLog("[runtime] Installing dependencies...");
-            const installProc = await wc.spawn("npm", ["install"]);
-            void installProc.output.pipeTo(
-              new WritableStream({
-                write(data) {
-                  appendLog(data);
-                },
-              })
-            );
-            const installExit = await installProc.exit;
-            if (installExit !== 0) {
-              throw new Error(`npm install failed with exit code ${installExit}`);
-            }
-
-            appendLog("[runtime] Starting dev server...");
-            const devProc = await wc.spawn("npm", ["run", "dev"]);
-            void devProc.output.pipeTo(
-              new WritableStream({
-                write(data) {
-                  appendLog(data);
-                },
-              })
-            );
-
-            startedRef.current = true;
-            syncedFilesRef.current = { ...files };
-          })()
-            .catch((error) => {
-              appendLog(`[runtime] Startup failed: ${String(error)}`);
-              startedRef.current = false;
-              throw error;
-            })
-            .finally(() => {
-              startingRef.current = null;
-            });
-        }
-
-        await startingRef.current;
+        syncedFilesRef.current = { ...files };
+        await ensureStarted();
+        syncedFilesRef.current = { ...files };
         return;
       }
 
@@ -271,33 +232,39 @@ export function useWebContainer() {
       const changedEntries = Object.entries(files).filter(
         ([logicalPath, content]) => previous[logicalPath] !== content
       );
+      const removedPaths = Object.keys(previous).filter(
+        (logicalPath) => !(logicalPath in files)
+      );
 
-      if (!changedEntries.length) {
+      if (!changedEntries.length && !removedPaths.length) {
         return;
       }
 
       await Promise.all(
-        changedEntries.map(async ([logicalPath, content]) => {
-          const runtimePath = toRuntimePath(logicalPath);
-          const dirPath = toDirectoryPath(runtimePath);
-          if (dirPath) {
-            await wc.fs.mkdir(dirPath, { recursive: true });
-          }
-          await wc.fs.writeFile(runtimePath, content);
-        })
+        [
+          ...changedEntries.map(async ([logicalPath, content]) => {
+            const runtimePath = toRuntimePath(logicalPath);
+            const dirPath = toDirectoryPath(runtimePath);
+            if (dirPath) {
+              await wc.fs.mkdir(dirPath, { recursive: true });
+            }
+            await wc.fs.writeFile(runtimePath, content);
+          }),
+          ...removedPaths.map(async (logicalPath) => {
+            const runtimePath = toRuntimePath(logicalPath);
+            await wc.fs.rm(runtimePath, { force: true, recursive: true });
+          }),
+        ]
       );
 
       syncedFilesRef.current = { ...files };
     },
-    [appendLog, isReady]
+    [ensureStarted, isReady]
   );
 
   const writeFile = useCallback(
     async (logicalPath: string, content: string) => {
-      const wc = wcRef.current;
-      if (!wc || !startedRef.current) {
-        return;
-      }
+      const wc = await ensureStarted();
 
       const runtimePath = toRuntimePath(logicalPath);
       const dirPath = toDirectoryPath(runtimePath);
@@ -305,9 +272,100 @@ export function useWebContainer() {
         await wc.fs.mkdir(dirPath, { recursive: true });
       }
       await wc.fs.writeFile(runtimePath, content);
+      syncedFilesRef.current = {
+        ...syncedFilesRef.current,
+        [logicalPath]: content,
+      };
     },
-    []
+    [ensureStarted]
   );
+
+  const readFile = useCallback(
+    async (logicalPath: string) => {
+      const wc = await ensureStarted();
+      const runtimePath = toRuntimePath(logicalPath);
+      const content = await wc.fs.readFile(runtimePath, "utf-8");
+      return typeof content === "string" ? content : new TextDecoder().decode(content);
+    },
+    [ensureStarted]
+  );
+
+  const readDir = useCallback(
+    async (logicalPath: string) => {
+      const wc = await ensureStarted();
+      const runtimePath = logicalPath === "/" ? "/" : toRuntimePath(logicalPath);
+      const entries = await wc.fs.readdir(runtimePath, { withFileTypes: true });
+      return entries.map((entry) => ({
+        name: entry.name,
+        path: runtimePath === "/" ? `/${entry.name}` : `${runtimePath}/${entry.name}`,
+        logicalPath: toLogicalPath(runtimePath === "/" ? entry.name : `${runtimePath}/${entry.name}`),
+        kind: entry.isDirectory() ? "directory" : "file",
+      }));
+    },
+    [ensureStarted]
+  );
+
+  const makeDir = useCallback(
+    async (logicalPath: string) => {
+      const wc = await ensureStarted();
+      const runtimePath = logicalPath === "/" ? "/" : toRuntimePath(logicalPath);
+      await wc.fs.mkdir(runtimePath, { recursive: true });
+    },
+    [ensureStarted]
+  );
+
+  const removePath = useCallback(
+    async (logicalPath: string, options?: { recursive?: boolean }) => {
+      const wc = await ensureStarted();
+      const runtimePath = toRuntimePath(logicalPath);
+      await wc.fs.rm(runtimePath, {
+        force: true,
+        recursive: options?.recursive ?? true,
+      });
+
+      const nextFiles = { ...syncedFilesRef.current };
+      delete nextFiles[logicalPath];
+      syncedFilesRef.current = nextFiles;
+    },
+    [ensureStarted]
+  );
+
+  const spawnProcess = useCallback(
+    async (
+      command: string,
+      args: string[] = [],
+      options?: { cwd?: string; waitForExit?: boolean }
+    ) => {
+      const wc = await ensureStarted();
+      const process = await wc.spawn(command, args, options?.cwd ? { cwd: options.cwd } : undefined);
+      const procId = registerProcess(process, `[proc] ${command} ${args.join(" ")}`.trim());
+
+      if (options?.waitForExit) {
+        await process.exit;
+      }
+
+      return getProcessSnapshot(procId);
+    },
+    [ensureStarted, getProcessSnapshot, registerProcess]
+  );
+
+  const readProcess = useCallback(async (procId: string) => {
+    const snapshot = getProcessSnapshot(procId);
+    if (!snapshot) {
+      throw new Error(`Process not found: ${procId}`);
+    }
+    return snapshot;
+  }, [getProcessSnapshot]);
+
+  const killProcess = useCallback(async (procId: string) => {
+    const managed = processesRef.current.get(procId);
+    if (!managed) {
+      return false;
+    }
+
+    managed.process.kill();
+    return true;
+  }, []);
 
   return useMemo(
     () => ({
@@ -315,8 +373,15 @@ export function useWebContainer() {
       serverUrl,
       logs,
       syncFiles,
+      readFile,
+      readDir,
+      makeDir,
+      removePath,
       writeFile,
+      spawnProcess,
+      readProcess,
+      killProcess,
     }),
-    [isReady, logs, serverUrl, syncFiles, writeFile]
+    [isReady, killProcess, logs, makeDir, readDir, readFile, readProcess, removePath, serverUrl, spawnProcess, syncFiles, writeFile]
   );
 }

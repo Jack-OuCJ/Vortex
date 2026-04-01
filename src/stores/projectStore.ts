@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { getPersistedTemplateFiles } from "@/lib/webcontainer-template";
 
 type ProjectFiles = Record<string, string>;
 type FileTimestamps = Record<string, string | null>;
@@ -13,16 +14,8 @@ export type ConflictCandidate = {
 
 type ConflictCandidates = Record<string, ConflictCandidate>;
 
-const DEFAULT_FILES: ProjectFiles = {
-  "/App.tsx": `export default function App() {
-  return (
-    <div style={{ padding: 20, fontFamily: 'sans-serif' }}>
-      <h1>Hello from Atom's Multi-Agent Demo</h1>
-      <p>This is a live preview of your generated app.</p>
-    </div>
-  )
-}`,
-};
+const DEFAULT_FILES: ProjectFiles = getPersistedTemplateFiles();
+const DEFAULT_ACTIVE_FILE_PATH = "/App.tsx";
 
 type ProjectStore = {
   projectId: string | null;
@@ -34,11 +27,13 @@ type ProjectStore = {
   conflictCandidates: ConflictCandidates;
   activeFilePath: string;
   setProjectMeta: (id: string, name: string) => void;
+  setProjectName: (name: string) => void;
   setSessionId: (sessionId: string | null) => void;
   setIsBootstrapping: (isBootstrapping: boolean) => void;
   setFiles: (files: ProjectFiles) => void;
   setRemoteFiles: (files: Array<{ path: string; content: string; updated_at?: string | null }>) => void;
   upsertFiles: (files: Array<{ path: string; code: string }>) => void;
+  removeFiles: (paths: string[]) => void;
   setFileTimestamps: (rows: Array<{ path: string; updated_at: string }>) => void;
   upsertConflictCandidates: (candidates: ConflictCandidate[]) => void;
   clearConflictCandidate: (path: string) => void;
@@ -54,14 +49,17 @@ export const useProjectStore = create<ProjectStore>((set) => ({
   files: DEFAULT_FILES,
   fileTimestamps: {},
   conflictCandidates: {},
-  activeFilePath: "/App.tsx",
+  activeFilePath: DEFAULT_ACTIVE_FILE_PATH,
   setProjectMeta: (id, name) => set({ projectId: id, projectName: name }),
+  setProjectName: (name) => set({ projectName: name }),
   setSessionId: (sessionId) => set({ sessionId }),
   setIsBootstrapping: (isBootstrapping) => set({ isBootstrapping }),
   setFiles: (files) =>
     set((state) => {
       const paths = Object.keys(files);
-      const fallbackPath = paths[0] ?? "/App.tsx";
+      const fallbackPath = files[DEFAULT_ACTIVE_FILE_PATH]
+        ? DEFAULT_ACTIVE_FILE_PATH
+        : paths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
       const nextActive = files[state.activeFilePath] ? state.activeFilePath : fallbackPath;
       return {
         files,
@@ -86,12 +84,15 @@ export const useProjectStore = create<ProjectStore>((set) => ({
       }
 
       const paths = Object.keys(nextFiles);
-      const fallbackPath = paths[0] ?? "/App.tsx";
+      const fallbackPath = nextFiles[DEFAULT_ACTIVE_FILE_PATH]
+        ? DEFAULT_ACTIVE_FILE_PATH
+        : paths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
       const nextActive = nextFiles[state.activeFilePath] ? state.activeFilePath : fallbackPath;
 
       return {
         files: nextFiles,
         fileTimestamps: nextTimestamps,
+        conflictCandidates: {},
         activeFilePath: nextActive,
       };
     }),
@@ -102,6 +103,34 @@ export const useProjectStore = create<ProjectStore>((set) => ({
         nextFiles[file.path] = file.code;
       }
       return { files: nextFiles };
+    }),
+  removeFiles: (paths) =>
+    set((state) => {
+      if (!paths.length) {
+        return state;
+      }
+
+      const nextFiles = { ...state.files };
+      const nextTimestamps = { ...state.fileTimestamps };
+      const nextConflicts = { ...state.conflictCandidates };
+
+      paths.forEach((path) => {
+        delete nextFiles[path];
+        delete nextTimestamps[path];
+        delete nextConflicts[path];
+      });
+
+      const remainingPaths = Object.keys(nextFiles);
+      const fallbackPath = nextFiles[DEFAULT_ACTIVE_FILE_PATH]
+        ? DEFAULT_ACTIVE_FILE_PATH
+        : remainingPaths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
+
+      return {
+        files: nextFiles,
+        fileTimestamps: nextTimestamps,
+        conflictCandidates: nextConflicts,
+        activeFilePath: nextFiles[state.activeFilePath] ? state.activeFilePath : fallbackPath,
+      };
     }),
   setFileTimestamps: (rows) =>
     set((state) => {
@@ -152,7 +181,7 @@ export const normalizeRemoteFiles = (
   files: Array<{ path: string; content: string }>
 ): ProjectFiles => {
   if (!files.length) {
-    return DEFAULT_FILES;
+    return { ...DEFAULT_FILES };
   }
 
   return files.reduce<ProjectFiles>((acc, file) => {

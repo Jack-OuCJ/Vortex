@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import Editor, { type Monaco, type OnMount } from "@monaco-editor/react";
+import { useTheme } from "next-themes";
 
 const languageByPath = (path: string) => {
   if (path.endsWith(".ts") || path.endsWith(".tsx")) return "typescript";
@@ -19,10 +20,13 @@ type MonacoCodeEditorProps = {
 };
 
 export function MonacoCodeEditor({ activePath, files, onCodeChange }: MonacoCodeEditorProps) {
+  const { resolvedTheme } = useTheme();
+  const monacoTheme = resolvedTheme === "dark" ? "atoms-dark" : "atoms-light";
+
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
-  const modelCacheRef = useRef<Map<string, Monaco.editor.ITextModel>>(new Map());
-  const viewStateRef = useRef<Map<string, Monaco.editor.ICodeEditorViewState | null>>(new Map());
+  const modelCacheRef = useRef<Map<string, any>>(new Map());
+  const viewStateRef = useRef<Map<string, any>>(new Map());
 
   const activeCode = files[activePath] ?? "";
   const language = useMemo(() => languageByPath(activePath), [activePath]);
@@ -46,6 +50,39 @@ export function MonacoCodeEditor({ activePath, files, onCodeChange }: MonacoCode
     editorRef.current = editor;
     monacoRef.current = monaco;
 
+    // 注册与全局主题匹配的自定义主题
+    monaco.editor.defineTheme("atoms-light", {
+      base: "vs",
+      inherit: true,
+      rules: [],
+      colors: {
+        "editor.background": "#ffffff",
+        "editor.foreground": "#09090b",
+        "editorLineNumber.foreground": "#a1a1aa",
+        "editorLineNumber.activeForeground": "#3f64ff",
+        "editor.lineHighlightBackground": "#f4f4f580",
+        "editorIndentGuide.background1": "#e4e4e7",
+        "editorIndentGuide.activeBackground1": "#a1a1aa",
+        "editor.selectionBackground": "#3f64ff30",
+      },
+    });
+    monaco.editor.defineTheme("atoms-dark", {
+      base: "vs-dark",
+      inherit: true,
+      rules: [],
+      colors: {
+        "editor.background": "#09090b",
+        "editor.foreground": "#fafafa",
+        "editorLineNumber.foreground": "#52525b",
+        "editorLineNumber.activeForeground": "#5271ff",
+        "editor.lineHighlightBackground": "#27272a80",
+        "editorIndentGuide.background1": "#27272a",
+        "editorIndentGuide.activeBackground1": "#52525b",
+        "editor.selectionBackground": "#5271ff40",
+      },
+    });
+    monaco.editor.setTheme(monacoTheme);
+
     const model = ensureModel(monaco, activePath, activeCode);
     editor.setModel(model);
 
@@ -56,6 +93,13 @@ export function MonacoCodeEditor({ activePath, files, onCodeChange }: MonacoCode
 
     editor.focus();
   };
+
+  // 跟随全局主题切换同步 Monaco 主题
+  useEffect(() => {
+    const monaco = monacoRef.current;
+    if (!monaco) return;
+    monaco.editor.setTheme(monacoTheme);
+  }, [monacoTheme]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -96,7 +140,7 @@ export function MonacoCodeEditor({ activePath, files, onCodeChange }: MonacoCode
     <Editor
       height="100%"
       language={language}
-      theme="vs-dark"
+      theme={monacoTheme}
       onMount={handleMount}
       onChange={(value) => {
         onCodeChange(activePath, value ?? "");

@@ -5,11 +5,14 @@ import { motion } from "framer-motion";
 import { RefreshCw, Send, Square } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { MonacoCodeEditor } from "@/components/MonacoCodeEditor";
 import { useWebContainer } from "@/hooks/useWebContainer";
+import { AGENT_AVATAR_MAP, AGENT_ROLE_LABEL_MAP } from "@/lib/agent-meta";
 import { useChatStore } from "@/stores/chatStore";
 import { useProjectStore } from "@/stores/projectStore";
 import { useUiStore } from "@/stores/uiStore";
+import type { WebContainerBridgeRequest, WebContainerBridgeResult, WebContainerToolInputMap, WebContainerToolName } from "@/lib/webcontainer-bridge";
 
 type ProjectSummary = {
   id: string;
@@ -22,9 +25,20 @@ type ProjectFile = {
   updated_at?: string;
 };
 
+type FileSyncResponse = {
+  fileTimestamps?: Array<{ path: string; updated_at: string }>;
+  deletedPaths?: string[];
+  conflicts?: Array<{
+    path: string;
+    expectedUpdatedAt: string | null;
+    serverUpdatedAt: string;
+    serverContent: string;
+  }>;
+};
+
 type AgentStreamEvent = {
   eventType?: "agent";
-  agent: "pm" | "architect" | "engineer" | "debug";
+  agent: "engineer";
   name: string;
   status: "thinking" | "done" | "error" | "streaming";
   content?: string;
@@ -39,7 +53,7 @@ type SessionStreamEvent = {
 
 type StepStreamEvent = {
   eventType: "step";
-  stepId: "pm" | "architect" | "engineer" | "debug" | "direct_reply";
+  stepId: "route" | "execute";
   title: string;
   status: "running" | "done" | "error";
   detail?: string;
@@ -50,16 +64,30 @@ type ToolStreamEvent = {
   callId: string;
   action: "tool_start" | "tool_input_delta" | "tool_result" | "tool_error";
   toolName:
-    | "analyze_demand"
-    | "plan_architecture"
-    | "generate_project_files"
-    | "debug_fix"
-    | "read_file"
-    | "write_file";
+    | "route_request"
+    | "execute_task"
+    | "wc.fs.readFile"
+    | "wc.fs.writeFile"
+    | "wc.fs.readdir"
+    | "wc.fs.mkdir"
+    | "wc.fs.rm"
+    | "wc.spawn"
+    | "wc.readProcess"
+    | "wc.killProcess";
   detail?: string;
 };
 
-type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent;
+type WebContainerRequestStreamEvent = {
+  eventType: "webcontainer_request";
+  request: WebContainerBridgeRequest;
+};
+
+type ProjectRenameStreamEvent = {
+  eventType: "project_rename";
+  projectName: string;
+};
+
+type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent | ProjectRenameStreamEvent | WebContainerRequestStreamEvent;
 
 const isThinkingOrStreaming = (status?: "thinking" | "done" | "error" | "streaming") =>
   status === "thinking" || status === "streaming";
@@ -94,10 +122,12 @@ export function WorkbenchContent() {
     conflictCandidates,
     activeFilePath,
     setProjectMeta,
+    setProjectName,
     setSessionId,
     setIsBootstrapping,
     setRemoteFiles,
     upsertFiles,
+    removeFiles,
     setFileTimestamps,
     upsertConflictCandidates,
     clearConflictCandidate,
@@ -113,6 +143,8 @@ export function WorkbenchContent() {
     appendMessage,
     upsertAgentMessage,
     updateLastAgentMessage,
+    loadHistory,
+    resetMessages,
   } = useChatStore();
 
   const [nowTs, setNowTs] = useState<number | null>(null);
@@ -122,7 +154,124 @@ export function WorkbenchContent() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const lastManualEditAtRef = useRef<Record<string, number>>({});
-  const { isReady: isContainerReady, serverUrl, logs, syncFiles, writeFile } = useWebContainer();
+  const dirtyFilePathsRef = useRef<Set<string>>(new Set());
+  const autoPromptConsumedRef = useRef(false);
+  const nextSendIsNewProjectRef = useRef(false);
+
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const searchParamsKey = searchParams.toString();
+  const {
+    isReady: isContainerReady,
+    serverUrl,
+    logs,
+    syncFiles,
+    writeFile,
+    readFile,
+    readDir,
+    makeDir,
+    removePath,
+    spawnProcess,
+    readProcess,
+    killProcess,
+  } = useWebContainer();
+
+  const executeWebContainerRequest = useCallback(async (request: WebContainerBridgeRequest): Promise<WebContainerBridgeResult> => {
+    try {
+      switch (request.toolName as WebContainerToolName) {
+        case "wc.fs.readFile": {
+          const input = request.input as WebContainerToolInputMap["wc.fs.readFile"];
+          const content = await readFile(input.path);
+          return {
+            ok: true,
+            detail: `${input.path} 已读取 (${content.length} 字符)`,
+            data: { path: input.path, content },
+          };
+        }
+        case "wc.fs.writeFile": {
+          const input = request.input as WebContainerToolInputMap["wc.fs.writeFile"];
+          await writeFile(input.path, input.content);
+          return {
+            ok: true,
+            detail: `${input.path} 已写入 (${input.content.length} 字符)`,
+            data: { path: input.path, length: input.content.length },
+          };
+        }
+        case "wc.fs.readdir": {
+          const input = request.input as WebContainerToolInputMap["wc.fs.readdir"];
+          const entries = await readDir(input.path);
+          return {
+            ok: true,
+            detail: `${input.path} 已列出 (${entries.length} 项)`,
+            data: { path: input.path, entries },
+          };
+        }
+        case "wc.fs.mkdir": {
+          const input = request.input as WebContainerToolInputMap["wc.fs.mkdir"];
+          await makeDir(input.path);
+          return {
+            ok: true,
+            detail: `${input.path} 已创建目录`,
+            data: { path: input.path },
+          };
+        }
+        case "wc.fs.rm": {
+          const input = request.input as WebContainerToolInputMap["wc.fs.rm"];
+          await removePath(input.path, { recursive: input.recursive === true });
+          return {
+            ok: true,
+            detail: `${input.path} 已删除`,
+            data: { path: input.path, recursive: input.recursive === true },
+          };
+        }
+        case "wc.spawn": {
+          const input = request.input as WebContainerToolInputMap["wc.spawn"];
+          const snapshot = await spawnProcess(input.command, input.args ?? [], {
+            cwd: input.cwd,
+            waitForExit: input.waitForExit === true,
+          });
+          return {
+            ok: true,
+            detail: `${input.command} ${(input.args ?? []).join(" ")}`.trim(),
+            data: snapshot,
+          };
+        }
+        case "wc.readProcess": {
+          const input = request.input as WebContainerToolInputMap["wc.readProcess"];
+          const snapshot = await readProcess(input.procId);
+          return {
+            ok: true,
+            detail: `${input.procId} 输出已读取`,
+            data: snapshot,
+          };
+        }
+        case "wc.killProcess": {
+          const input = request.input as WebContainerToolInputMap["wc.killProcess"];
+          const killed = await killProcess(input.procId);
+          return killed
+            ? {
+                ok: true,
+                detail: `${input.procId} 已终止`,
+                data: { procId: input.procId, killed: true },
+              }
+            : {
+                ok: false,
+                error: `Process not found: ${input.procId}`,
+              };
+        }
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "WebContainer request failed",
+      };
+    }
+
+    return {
+      ok: false,
+      error: `Unsupported WebContainer tool: ${request.toolName}`,
+    };
+  }, [killProcess, makeDir, readDir, readFile, readProcess, removePath, spawnProcess, writeFile]);
 
   const handleStop = () => {
     if (abortControllerRef.current) {
@@ -133,6 +282,116 @@ export function WorkbenchContent() {
   useEffect(() => {
     setNowTs(Date.now());
   }, []);
+
+  const markDirtyPaths = useCallback((paths: string[]) => {
+    if (!paths.length) {
+      return;
+    }
+
+    paths.forEach((path) => {
+      dirtyFilePathsRef.current.add(path);
+    });
+  }, []);
+
+  const syncProjectFilesToServer = useCallback(
+    async (filesSnapshot: Record<string, string>, deletedPaths: string[] = []) => {
+      if (!projectId) {
+        return {
+          ok: false,
+          updatedCount: 0,
+          conflictCount: 0,
+          updatedPaths: [] as string[],
+          deletedPaths: [] as string[],
+          conflictPaths: [] as string[],
+        };
+      }
+
+      const files = Object.entries(filesSnapshot).map(([path, content]) => ({
+        path,
+        content,
+        expectedUpdatedAt: fileTimestamps[path] ?? null,
+      }));
+
+      if (!files.length && !deletedPaths.length) {
+        return {
+          ok: true,
+          updatedCount: 0,
+          conflictCount: 0,
+          updatedPaths: [] as string[],
+          deletedPaths: [] as string[],
+          conflictPaths: [] as string[],
+        };
+      }
+
+      const response = await fetch(`/api/projects/${projectId}/files`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          files,
+          deletedFiles: deletedPaths.map((path) => ({
+            path,
+            expectedUpdatedAt: fileTimestamps[path] ?? null,
+          })),
+        }),
+      });
+
+      const isConflict = response.status === 409;
+      if (!response.ok && !isConflict) {
+        return {
+          ok: false,
+          updatedCount: 0,
+          conflictCount: 0,
+          updatedPaths: [] as string[],
+          deletedPaths: [] as string[],
+          conflictPaths: [] as string[],
+        };
+      }
+
+      const payload = (await response.json()) as FileSyncResponse;
+
+      if (Array.isArray(payload.fileTimestamps) && payload.fileTimestamps.length) {
+        setFileTimestamps(payload.fileTimestamps);
+      }
+
+      if (Array.isArray(payload.conflicts) && payload.conflicts.length) {
+        const candidates = payload.conflicts.map((conflict) => {
+          const localContent = filesSnapshot[conflict.path] ?? "";
+          return {
+            path: conflict.path,
+            localContent,
+            serverContent: conflict.serverContent,
+            mergedContent: buildMergeCandidate(
+              localContent,
+              conflict.serverContent,
+              conflict.serverUpdatedAt
+            ),
+            serverUpdatedAt: conflict.serverUpdatedAt,
+          };
+        });
+
+        upsertConflictCandidates(candidates);
+
+        payload.conflicts.forEach((conflict) => {
+          upsertStep({
+            id: `server-conflict:${conflict.path}`,
+            title: "服务端冲突拦截",
+            status: "error",
+            detail: `${conflict.path} 已在其他会话更新，请刷新后重试`,
+          });
+        });
+      }
+
+      return {
+        ok: true,
+        updatedCount: payload.fileTimestamps?.length ?? 0,
+        conflictCount: payload.conflicts?.length ?? 0,
+        updatedPaths: payload.fileTimestamps?.map((row) => row.path) ?? [],
+        deletedPaths: payload.deletedPaths ?? [],
+        conflictPaths: payload.conflicts?.map((conflict) => conflict.path) ?? [],
+      };
+    },
+    [fileTimestamps, projectId, setFileTimestamps, upsertConflictCandidates, upsertStep]
+  );
 
   const formatMessageTime = (ts?: number) => {
     if (!ts) return "";
@@ -175,19 +434,42 @@ export function WorkbenchContent() {
 
     const bootstrapProject = async () => {
       try {
-        const listRes = await fetch("/api/projects", { method: "GET" });
-        if (!listRes.ok) {
-          return;
-        }
+        if (!mounted) return;
 
-        const listJson = (await listRes.json()) as { projects?: ProjectSummary[] };
-        let activeProject = listJson.projects?.[0];
+        setIsBootstrapping(true);
+        resetMessages();
+        setSessionId(null);
+
+        // newProject=true means user came from homepage with a fresh prompt — always create a new project
+        const isNewProjectFlow = searchParams.get("newProject") === "true";
+        // project_id means user explicitly clicked a project to open
+        const targetProjectId = searchParams.get("project_id");
+
+        let activeProject: ProjectSummary | undefined;
+
+        if (targetProjectId) {
+          // Load the specific project the user clicked
+          resetMessages();
+          const projectRes = await fetch(`/api/projects/${targetProjectId}`, { method: "GET" });
+          if (projectRes.ok) {
+            const projectJson = (await projectRes.json()) as { project?: ProjectSummary };
+            activeProject = projectJson.project;
+          }
+        } else if (!isNewProjectFlow) {
+          const listRes = await fetch("/api/projects", { method: "GET" });
+          if (!listRes.ok) {
+            return;
+          }
+
+          const listJson = (await listRes.json()) as { projects?: ProjectSummary[] };
+          activeProject = listJson.projects?.[0];
+        }
 
         if (!activeProject) {
           const createRes = await fetch("/api/projects", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: `Project ${new Date().toISOString().slice(0, 16)}` }),
+            body: JSON.stringify({ name: `新项目 ${new Date().toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}` }),
           });
 
           if (!createRes.ok) {
@@ -202,9 +484,10 @@ export function WorkbenchContent() {
 
         setProjectMeta(activeProject.id, activeProject.name);
 
-        const filesRes = await fetch(`/api/projects/${activeProject.id}/files`, {
-          method: "GET",
-        });
+        const [filesRes, sessionsRes] = await Promise.all([
+          fetch(`/api/projects/${activeProject.id}/files`, { method: "GET" }),
+          fetch(`/api/projects/${activeProject.id}/sessions`, { method: "GET" }),
+        ]);
 
         if (!filesRes.ok) {
           return;
@@ -213,6 +496,23 @@ export function WorkbenchContent() {
         const filesJson = (await filesRes.json()) as { files?: ProjectFile[] };
         if (!mounted) return;
         setRemoteFiles(filesJson.files ?? []);
+
+        if (sessionsRes.ok) {
+          const sessionsJson = (await sessionsRes.json()) as {
+            session?: { id: string } | null;
+            messages?: Array<{
+              role: "user" | "agent";
+              agent_name: string | null;
+              agent_role: string | null;
+              content: string;
+              status: "thinking" | "streaming" | "done" | "stopped" | "error";
+              created_at: string;
+            }>;
+          };
+          if (!mounted) return;
+          setSessionId(sessionsJson.session?.id ?? null);
+          loadHistory(sessionsJson.messages ?? []);
+        }
       } catch (error) {
         console.error("Failed to bootstrap project", error);
       } finally {
@@ -227,10 +527,23 @@ export function WorkbenchContent() {
     return () => {
       mounted = false;
     };
-  }, [setIsBootstrapping, setProjectMeta, setRemoteFiles]);
+  }, [
+    loadHistory,
+    resetMessages,
+    searchParams,
+    searchParamsKey,
+    setIsBootstrapping,
+    setProjectMeta,
+    setRemoteFiles,
+    setSessionId,
+  ]);
 
   useEffect(() => {
     if (!projectId || isBootstrapping) {
+      return;
+    }
+
+    if (!dirtyFilePathsRef.current.size) {
       return;
     }
 
@@ -239,64 +552,29 @@ export function WorkbenchContent() {
     }
 
     saveTimerRef.current = window.setTimeout(() => {
-      const files = Object.entries(projectFiles).map(([path, content]) => ({
-        path,
-        content,
-        expectedUpdatedAt: fileTimestamps[path] ?? null,
-      }));
+      const dirtyPaths = Array.from(dirtyFilePathsRef.current);
+      const dirtySnapshot = dirtyPaths.reduce<Record<string, string>>((acc, path) => {
+        const content = projectFiles[path];
+        if (typeof content === "string") {
+          acc[path] = content;
+        }
+        return acc;
+      }, {});
+      const deletedPaths = dirtyPaths.filter((path) => typeof projectFiles[path] !== "string");
 
-      void fetch(`/api/projects/${projectId}/files`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ files }),
-      })
-        .then(async (response) => {
-          const isConflict = response.status === 409;
-          if (!response.ok && !isConflict) {
+      if (!Object.keys(dirtySnapshot).length && !deletedPaths.length) {
+        return;
+      }
+
+      void syncProjectFilesToServer(dirtySnapshot, deletedPaths)
+        .then((result) => {
+          if (!result.ok) {
             return;
           }
 
-          const payload = (await response.json()) as {
-            fileTimestamps?: Array<{ path: string; updated_at: string }>;
-            conflicts?: Array<{
-              path: string;
-              expectedUpdatedAt: string | null;
-              serverUpdatedAt: string;
-              serverContent: string;
-            }>;
-          };
-
-          if (Array.isArray(payload.fileTimestamps) && payload.fileTimestamps.length) {
-            setFileTimestamps(payload.fileTimestamps);
-          }
-
-          if (Array.isArray(payload.conflicts) && payload.conflicts.length) {
-            const candidates = payload.conflicts.map((conflict) => {
-              const localContent = projectFiles[conflict.path] ?? "";
-              return {
-                path: conflict.path,
-                localContent,
-                serverContent: conflict.serverContent,
-                mergedContent: buildMergeCandidate(
-                  localContent,
-                  conflict.serverContent,
-                  conflict.serverUpdatedAt
-                ),
-                serverUpdatedAt: conflict.serverUpdatedAt,
-              };
-            });
-
-            upsertConflictCandidates(candidates);
-
-            payload.conflicts.forEach((conflict) => {
-              upsertStep({
-                id: `server-conflict:${conflict.path}`,
-                title: "服务端冲突拦截",
-                status: "error",
-                detail: `${conflict.path} 已在其他会话更新，请刷新后重试`,
-              });
-            });
-          }
+          [...result.updatedPaths, ...result.deletedPaths, ...result.conflictPaths].forEach((path) => {
+            dirtyFilePathsRef.current.delete(path);
+          });
         })
         .catch(() => {
           // noop
@@ -309,13 +587,10 @@ export function WorkbenchContent() {
       }
     };
   }, [
-    fileTimestamps,
     isBootstrapping,
     projectFiles,
     projectId,
-    setFileTimestamps,
-    upsertConflictCandidates,
-    upsertStep,
+    syncProjectFilesToServer,
   ]);
 
   useEffect(() => {
@@ -326,9 +601,26 @@ export function WorkbenchContent() {
     void syncFiles(projectFiles);
   }, [isBootstrapping, isContainerReady, projectFiles, syncFiles]);
 
+  // 首页 prompt 跳转后自动触发：等容器就绪 + bootstrap 完成后，一次性消费 URL 中的 prompt 参数
+  useEffect(() => {
+    if (isBootstrapping || !isContainerReady || autoPromptConsumedRef.current) return;
+
+    const initialPrompt = searchParams.get("prompt");
+    if (!initialPrompt) return;
+
+    autoPromptConsumedRef.current = true;
+    if (searchParams.get("newProject") === "true") {
+      nextSendIsNewProjectRef.current = true;
+    }
+    setInputValue(initialPrompt);
+    // 清除 URL 参数，避免刷新页面重复触发
+    router.replace("/workbench");
+  }, [isBootstrapping, isContainerReady, router, searchParams, setInputValue]);
+
   const handleSend = async () => {
     if (!inputValue.trim() || isGenerating) return;
     const userMsg = inputValue.trim();
+    const now = Date.now();
 
     appendMessage({
       agent: "user",
@@ -344,17 +636,50 @@ export function WorkbenchContent() {
     abortControllerRef.current = new AbortController();
 
     try {
-      // Create project files array format for backend
-      const currentFiles = Object.entries(projectFiles).map(([path, code]) => ({ path, code }));
+      const recentEditedPaths = Object.entries(lastManualEditAtRef.current)
+        .filter(([, timestamp]) => now - timestamp < 10 * 60 * 1000)
+        .sort((a, b) => b[1] - a[1])
+        .map(([path]) => path);
+
+      const hotFilePaths = Array.from(
+        new Set([
+          activeFilePath,
+          ...Array.from(dirtyFilePathsRef.current),
+          ...recentEditedPaths,
+        ].filter((path): path is string => Boolean(path && typeof projectFiles[path] === "string")))
+      ).slice(0, 6);
+
+      const hotFiles = hotFilePaths.map((path) => ({
+        path,
+        code: projectFiles[path],
+      }));
+
+      const fileTree = Object.entries(projectFiles)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([path, code]) => {
+          const lastEditedAt = lastManualEditAtRef.current[path] ?? 0;
+          return {
+            path,
+            size: code.length,
+            isActive: path === activeFilePath,
+            isDirty: dirtyFilePathsRef.current.has(path),
+            isRecentlyEdited: lastEditedAt > 0 && now - lastEditedAt < 10 * 60 * 1000,
+          };
+        });
+
+      const isNewProject = nextSendIsNewProjectRef.current;
+      nextSendIsNewProjectRef.current = false;
 
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: userMsg,
-          projectFiles: currentFiles,
+          hotFiles,
+          fileTree,
           projectId,
           sessionId,
+          isNewProject,
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -381,6 +706,19 @@ export function WorkbenchContent() {
 
               if (data.eventType === "session") {
                 setSessionId(data.sessionId);
+                continue;
+              }
+
+              if (data.eventType === "project_rename") {
+                const newName = data.projectName;
+                setProjectName(newName);
+                if (projectId) {
+                  void fetch(`/api/projects/${projectId}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ name: newName }),
+                  }).catch(() => {/* best-effort rename */});
+                }
                 continue;
               }
 
@@ -427,17 +765,49 @@ export function WorkbenchContent() {
 
                 continue;
               }
+
+              if (data.eventType === "webcontainer_request") {
+                const stepId = `wc:${data.request.requestId}`;
+                upsertStep({
+                  id: stepId,
+                  title: `WebContainer: ${data.request.toolName}`,
+                  status: "running",
+                  detail: "浏览器容器正在执行请求",
+                });
+
+                void executeWebContainerRequest(data.request)
+                  .then(async (result) => {
+                    await fetch("/api/webcontainer-bridge", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        requestId: data.request.requestId,
+                        result,
+                      }),
+                    });
+
+                    upsertStep({
+                      id: stepId,
+                      title: `WebContainer: ${data.request.toolName}`,
+                      status: result.ok ? "done" : "error",
+                      detail: result.ok ? result.detail : result.error,
+                    });
+                  })
+                  .catch((error: unknown) => {
+                    upsertStep({
+                      id: stepId,
+                      title: `WebContainer: ${data.request.toolName}`,
+                      status: "error",
+                      detail: error instanceof Error ? error.message : "WebContainer 请求失败",
+                    });
+                  });
+
+                continue;
+              }
               
               const agentData = data as AgentStreamEvent;
 
-              const avatarMap: Record<string, string> = {
-                pm: "/teams-avatar/pm.png",
-                architect: "/teams-avatar/50-engineer.png",
-                engineer: "/teams-avatar/50-engineer.png",
-                debug: "/teams-avatar/50-engineer.png",
-              };
-              
-              const avatar = avatarMap[agentData.agent] || avatarMap.engineer;
+              const avatar = AGENT_AVATAR_MAP[agentData.agent] || AGENT_AVATAR_MAP.engineer;
 
               upsertAgentMessage({
                 agent: agentData.agent,
@@ -451,6 +821,8 @@ export function WorkbenchContent() {
               const generatedFiles = agentData.projectFiles;
               if (generatedFiles && Array.isArray(generatedFiles)) {
                 const now = Date.now();
+                const isFinalEngineerSnapshot =
+                  agentData.agent === "engineer" && agentData.status === "done";
                 const safeFiles = generatedFiles.filter((f) => {
                   const lastEditAt = lastManualEditAtRef.current[f.path] ?? 0;
                   const isRecentlyEdited = now - lastEditAt < 1500;
@@ -466,13 +838,47 @@ export function WorkbenchContent() {
 
                   return !isRecentlyEdited;
                 });
+                const latestFiles = useProjectStore.getState().files;
+                const incomingPaths = new Set(generatedFiles.map((file) => file.path));
+                const deletedPaths = isFinalEngineerSnapshot
+                  ? Object.keys(latestFiles).filter((path) => {
+                      if (incomingPaths.has(path)) {
+                        return false;
+                      }
+
+                      const lastEditAt = lastManualEditAtRef.current[path] ?? 0;
+                      const isRecentlyEdited = now - lastEditAt < 1500;
+
+                      if (isRecentlyEdited) {
+                        upsertStep({
+                          id: `conflict:${path}`,
+                          title: "文件冲突保护",
+                          status: "running",
+                          detail: `${path} 最近正在编辑，暂不删除 Agent 未返回的文件`,
+                        });
+                      }
+
+                      return !isRecentlyEdited;
+                    })
+                  : [];
 
                 safeFiles.forEach((f) => {
                   void writeFile(f.path, f.code);
                 });
 
+                if (safeFiles.length || deletedPaths.length) {
+                  markDirtyPaths([
+                    ...safeFiles.map((file) => file.path),
+                    ...deletedPaths,
+                  ]);
+                }
+
                 if (safeFiles.length) {
                   upsertFiles(safeFiles);
+                }
+
+                if (deletedPaths.length) {
+                  removeFiles(deletedPaths);
                 }
 
                 const incomingTimestamps = agentData.fileTimestamps;
@@ -483,6 +889,52 @@ export function WorkbenchContent() {
                   if (appliedTimestamps.length) {
                     setFileTimestamps(appliedTimestamps);
                   }
+                }
+                if (isFinalEngineerSnapshot) {
+                  const syncFilesSnapshot = safeFiles.reduce<Record<string, string>>((acc, file) => {
+                    acc[file.path] = file.code;
+                    return acc;
+                  }, {});
+                  const syncPaths = [
+                    ...Object.keys(syncFilesSnapshot),
+                    ...deletedPaths,
+                  ];
+
+                  if (!syncPaths.length) {
+                    continue;
+                  }
+
+                  upsertStep({
+                    id: "sync-agent-files",
+                    title: "同步 Agent 文件",
+                    status: "running",
+                    detail: `正在回写 ${syncPaths.length} 个 Agent 变更文件...`,
+                  });
+                  void syncProjectFilesToServer(syncFilesSnapshot, deletedPaths)
+                    .then((syncResult) => {
+                      if (syncResult.ok) {
+                        [...syncResult.updatedPaths, ...syncResult.deletedPaths, ...syncResult.conflictPaths].forEach((path) => {
+                          dirtyFilePathsRef.current.delete(path);
+                        });
+                      }
+
+                      upsertStep({
+                        id: "sync-agent-files",
+                        title: "同步 Agent 文件",
+                        status: syncResult.ok ? "done" : "error",
+                        detail: syncResult.ok
+                          ? `已同步 ${syncPaths.length} 个 Agent 变更到数据库`
+                          : "同步数据库失败，请稍后重试",
+                      });
+                    })
+                    .catch((err: unknown) => {
+                      upsertStep({
+                        id: "sync-agent-files",
+                        title: "同步 Agent 文件",
+                        status: "error",
+                        detail: err instanceof Error ? err.message : "写回数据库失败",
+                      });
+                    });
                 }
               }
             } catch {
@@ -547,6 +999,7 @@ export function WorkbenchContent() {
 
   const handleEditorChange = (path: string, nextCode: string) => {
     lastManualEditAtRef.current[path] = Date.now();
+    markDirtyPaths([path]);
     updateActiveFile(path, nextCode);
     void writeFile(path, nextCode);
   };
@@ -600,6 +1053,7 @@ export function WorkbenchContent() {
     const candidate = conflictCandidates[path];
     if (!candidate) return;
 
+    markDirtyPaths([path]);
     updateActiveFile(path, candidate.mergedContent);
     void writeFile(path, candidate.mergedContent);
     setFileTimestamps([{ path, updated_at: candidate.serverUpdatedAt }]);
@@ -616,6 +1070,7 @@ export function WorkbenchContent() {
     const candidate = conflictCandidates[path];
     if (!candidate) return;
 
+    markDirtyPaths([path]);
     updateActiveFile(path, candidate.serverContent);
     void writeFile(path, candidate.serverContent);
     setFileTimestamps([{ path, updated_at: candidate.serverUpdatedAt }]);
@@ -773,7 +1228,7 @@ export function WorkbenchContent() {
                         <span className="text-sm font-semibold text-foreground/80">{msg.name}</span>
                         <span className="text-muted-foreground/40 text-xs">|</span>
                         <span className="text-muted-foreground text-xs font-normal">
-                          {msg.agent === "engineer" ? "工程师" : msg.agent === "pm" ? "产品经理" : msg.agent === "architect" ? "架构师" : msg.agent === "debug" ? "调试测试" : msg.agent}
+                          {AGENT_ROLE_LABEL_MAP[msg.agent] ?? msg.agent}
                         </span>
                         <span className="text-[11px] text-muted-foreground/50 opacity-0 group-hover:opacity-100 transition-opacity duration-300 ml-1 pb-[1px]">
                           {timeStr}

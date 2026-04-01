@@ -8,9 +8,19 @@ const fileSchema = z.object({
   expectedUpdatedAt: z.string().datetime().nullable().optional(),
 });
 
-const upsertFilesSchema = z.object({
-  files: z.array(fileSchema).min(1).max(200),
+const deletedFileSchema = z.object({
+  path: z.string().trim().min(1).max(500),
+  expectedUpdatedAt: z.string().datetime().nullable().optional(),
 });
+
+const syncFilesSchema = z
+  .object({
+    files: z.array(fileSchema).max(200).default([]),
+    deletedFiles: z.array(deletedFileSchema).max(200).default([]),
+  })
+  .refine((payload) => payload.files.length > 0 || payload.deletedFiles.length > 0, {
+    message: "At least one file operation is required",
+  });
 
 type RouteContext = {
   params: Promise<{ id: string }>;
@@ -77,20 +87,28 @@ export async function PUT(req: Request, context: RouteContext) {
   }
 
   const body = await req.json().catch(() => null);
-  const parsed = upsertFilesSchema.safeParse(body);
+  const parsed = syncFilesSchema.safeParse(body);
 
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
   }
 
   const requestedFiles = parsed.data.files;
-  const requestedPaths = requestedFiles.map((file) => file.path);
+  const deletedFiles = parsed.data.deletedFiles;
+  const requestedPaths = Array.from(
+    new Set([
+      ...requestedFiles.map((file) => file.path),
+      ...deletedFiles.map((file) => file.path),
+    ])
+  );
 
-  const { data: existingRows, error: existingError } = await access.supabase
-    .from("project_files")
-    .select("path, updated_at, content")
-    .eq("project_id", id)
-    .in("path", requestedPaths);
+  const { data: existingRows, error: existingError } = requestedPaths.length
+    ? await access.supabase
+        .from("project_files")
+        .select("path, updated_at, content")
+        .eq("project_id", id)
+        .in("path", requestedPaths)
+    : { data: [], error: null };
 
   if (existingError) {
     return NextResponse.json({ error: existingError.message }, { status: 500 });
@@ -143,10 +161,48 @@ export async function PUT(req: Request, context: RouteContext) {
       content: file.content,
     }));
 
+  const deletedPaths = deletedFiles
+    .filter((file) => {
+      const serverSnapshot = existingByPath.get(file.path);
+      const expectedUpdatedAt = file.expectedUpdatedAt ?? null;
+
+      if (!serverSnapshot) {
+        return false;
+      }
+
+      if (
+        expectedUpdatedAt &&
+        serverSnapshot.updatedAt !== expectedUpdatedAt
+      ) {
+        conflicts.push({
+          path: file.path,
+          expectedUpdatedAt,
+          serverUpdatedAt: serverSnapshot.updatedAt,
+          serverContent: serverSnapshot.content,
+        });
+        return false;
+      }
+
+      return true;
+    })
+    .map((file) => file.path);
+
   if (rowsToUpsert.length) {
     const { error } = await access.supabase
       .from("project_files")
       .upsert(rowsToUpsert, { onConflict: "project_id,path" });
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+  }
+
+  if (deletedPaths.length) {
+    const { error } = await access.supabase
+      .from("project_files")
+      .delete()
+      .eq("project_id", id)
+      .in("path", deletedPaths);
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
@@ -176,6 +232,7 @@ export async function PUT(req: Request, context: RouteContext) {
     ok: true,
     updated: rowsToUpsert.length,
     fileTimestamps: updatedRows,
+    deletedPaths,
     conflicts,
   };
 
