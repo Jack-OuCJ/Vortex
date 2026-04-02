@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
 const DEFAULT_AVATAR_URL =
-  "https://rmjacyfbivgftfgxymbm.supabase.co/storage/v1/object/public/avatars/Gemini_Generated_Image_nishebnishebnish.png";
+  "https://rmjacyfbivgftfgxymbm.supabase.co/storage/v1/object/public/avatars/default-avatar.png";
 
 function getGoogleDisplayName(user: {
   email?: string;
@@ -19,7 +19,7 @@ function getGoogleDisplayName(user: {
 
   if (fullName) return fullName;
   if (name) return name;
-  return user.email?.split("@")[0] ?? "Atoms_User";
+  return user.email?.split("@")[0] ?? "Vortex_User";
 }
 
 function getGoogleAvatarUrl(user: { user_metadata?: Record<string, unknown> }) {

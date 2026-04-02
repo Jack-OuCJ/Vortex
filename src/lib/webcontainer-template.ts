@@ -37,7 +37,7 @@ export const WEBCONTAINER_TEMPLATE: FileSystemTree = {
     file: {
       contents: JSON.stringify(
         {
-          name: "atoms-runtime",
+          name: "vortex-runtime",
           private: true,
           version: "0.0.1",
           type: "module",
@@ -69,7 +69,7 @@ export const WEBCONTAINER_TEMPLATE: FileSystemTree = {
   "index.html": {
     file: {
       contents:
-        '<!doctype html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>ATOMS Preview</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>',
+        '<!doctype html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>VORTEX Preview</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>',
     },
   },
 

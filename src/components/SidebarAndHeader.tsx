@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { User } from "@supabase/supabase-js";
 import {
   Atom,
@@ -116,13 +117,11 @@ export function SidebarAndHeader({
   }, []);
 
   useEffect(() => {
-    // Avoid synchronous setState in effect
-    setTimeout(() => {
-      setMounted(true);
-      const pinned = localStorage.getItem("sidebarPinned") === "true";
-      setIsPinned(pinned);
-      if (onSidebarChange) onSidebarChange(pinned);
-    }, 0);
+    setMounted(true);
+
+    const pinned = localStorage.getItem("sidebarPinned") === "true";
+    setIsPinned(pinned);
+    onSidebarChange?.(pinned);
   }, [onSidebarChange]);
 
   const togglePinned = () => {
@@ -174,7 +173,7 @@ export function SidebarAndHeader({
             >
               <Atom className="size-5 text-foreground transition-transform duration-300 group-hover:scale-105" />
               <span className="text-[22px] font-semibold tracking-tight text-foreground">
-                Atoms
+                Vortex
               </span>
             </Link>
           ) : null}
@@ -185,7 +184,7 @@ export function SidebarAndHeader({
               className="opacity-40 hover:opacity-100 transition-opacity p-2 -ml-2 select-none flex items-center justify-center cursor-pointer"
               aria-label="打开侧边栏"
             >
-              <div className="w-1.5 h-6 bg-foreground/20 rounded-full" />
+              <PanelLeft className="size-4.5" />
             </button>
           )}
         </div>
@@ -239,7 +238,7 @@ export function SidebarAndHeader({
             >
               <Atom className="size-5 text-foreground transition-transform duration-300 group-hover:scale-105 flex-shrink-0" />
               <span className="text-[18px] font-semibold tracking-tight text-foreground truncate">
-                Atoms
+                Vortex
               </span>
             </Link>
 
@@ -286,12 +285,16 @@ export function SidebarAndHeader({
             >
               <div className="flex items-center gap-2.5 overflow-hidden">
                 {profileAvatarUrl && !avatarLoadFailed ? (
-                  <img
-                    src={profileAvatarUrl}
-                    alt={profileName}
-                    onError={() => setAvatarLoadFailed(true)}
-                    className="size-8 rounded-full object-cover flex-shrink-0 shadow-sm"
-                  />
+                  <div className="relative size-8 flex-shrink-0 overflow-hidden rounded-full shadow-sm">
+                    <Image
+                      src={profileAvatarUrl}
+                      alt={profileName}
+                      fill
+                      sizes="32px"
+                      onError={() => setAvatarLoadFailed(true)}
+                      className="object-cover"
+                    />
+                  </div>
                 ) : (
                   <div className="size-8 rounded-full bg-black flex-shrink-0 flex items-center justify-center text-white text-xs font-bold shadow-sm">
                     {avatarFallback}

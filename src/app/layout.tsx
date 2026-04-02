@@ -18,8 +18,8 @@ const ibmPlexSerif = IBM_Plex_Serif({
 });
 
 export const metadata: Metadata = {
-  title: "Atoms 风格落地页",
-  description: "Atoms 首屏样式复刻页面",
+  title: "Vortex：用AI构建网站和应用",
+  description: "Vortex 智能构建生成工具",
 };
 
 export default function RootLayout({
@@ -33,7 +33,7 @@ export default function RootLayout({
       className={`${ibmPlexSans.variable} ${ibmPlexSerif.variable} h-full antialiased`}
       suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col">
+      <body className="min-h-full flex flex-col" suppressHydrationWarning>
         <ThemeProvider
           attribute="class"
           defaultTheme="system"

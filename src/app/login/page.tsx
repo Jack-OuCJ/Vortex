@@ -134,7 +134,7 @@ export default function LoginPage() {
             登录或注册
           </h1>
           <p className="mt-1.5 text-center text-[15px] font-medium text-muted-foreground">
-            开始使用 Atoms 创作
+            开始使用 Vortex 创作
           </p>
 
           <button

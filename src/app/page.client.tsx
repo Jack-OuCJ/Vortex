@@ -3,7 +3,7 @@
 import { useCallback, useMemo, useState, useEffect } from "react";
 import Image from "next/image";
 import { motion } from "framer-motion";
-import { Plus, ArrowRight, LayoutGrid } from "lucide-react";
+import { Square, LayoutGrid } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import type { User } from "@supabase/supabase-js";
@@ -152,7 +152,7 @@ export default function HomeClient({
           transition={{ duration: 0.55, ease: "easeOut" }}
           className="flex w-full max-w-[760px] flex-col items-center"
         >
-          <div className="mb-5 flex items-center justify-center">
+          <div className="mb-3 flex items-center justify-center">
             {AGENTS.map((agent, index) => (
               <motion.div
                 key={agent.role}
@@ -187,12 +187,12 @@ export default function HomeClient({
             ))}
           </div>
 
-          <h1 className="text-center text-[36px] font-semibold leading-[1.1] tracking-tight sm:text-[52px] lg:text-[60px]">
+          <h1 className="text-center text-[44px] font-semibold leading-[1.1] tracking-tight sm:text-[52px] lg:text-[60px]">
             把想法变成可销售的
-            <span className="font-serif italic"> 产品</span>
+            <span> 产品</span>
           </h1>
 
-          <p className="mt-4 text-center text-[14px] opacity-70 sm:text-[16px] md:whitespace-nowrap">
+          <p className="mt-2 text-center text-[14px] opacity-70 sm:text-[16px] md:whitespace-nowrap">
             AI 员工用于验证想法、构建产品并获取客户。几分钟内完成。无需编码。
           </p>
 
@@ -200,7 +200,7 @@ export default function HomeClient({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ delay: 0.22, duration: 0.45 }}
-            className="mt-8 w-full max-w-[700px] rounded-[16px] border-border bg-muted p-2.5 shadow-sm transition-all duration-300 hover:scale-[1.01] border "
+            className="mt-5 w-full max-w-[750px] rounded-[16px] border-border bg-background p-2.5 shadow-sm transition-all duration-300 hover:scale-[1.01] border "
           >
             <textarea
               value={prompt}
@@ -212,25 +212,29 @@ export default function HomeClient({
               }}
               onKeyDown={handleKeyDown}
               placeholder="创建一个具有用户登录和数据库存储功能的SaaS订阅应用..."
-              className="h-[88px] w-full resize-none rounded-xl border-0 bg-transparent p-2 text-[16px] text-foreground outline-none placeholder:text-foreground/40"
+              className="h-[80px] w-full resize-none rounded-xl border-0 bg-transparent p-2 text-[16px] text-foreground outline-none placeholder:text-foreground/40"
               disabled={isSubmitting}
             />
 
-            <div className="mt-2 flex items-center justify-between px-2 pb-1">
+            <div className="mt-2 flex items-center justify-between px-1 pb-1">
               <button
                 aria-label="上传附件"
-                className="inline-flex size-8 items-center justify-center rounded-[8px] border border-foreground/10 bg-background/80 text-foreground/60 transition-all duration-300 hover:scale-105 hover:bg-background"
+                className="inline-flex size-7 items-center justify-center rounded-[8px] border border-foreground/10 bg-background text-foreground/60 transition-all duration-300 hover:scale-105 hover:bg-muted"
               >
-                <Plus className="size-4" />
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
               </button>
 
               <button
                 disabled={!canSubmit || isSubmitting}
                 onClick={handleSubmit}
-                className="inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-semibold text-primary-foreground transition-all duration-300 disabled:cursor-not-allowed disabled:bg-primary/50 disabled:text-primary-foreground/85 enabled:bg-primary enabled:hover:scale-105 enabled:hover:bg-primary/90"
+                className="inline-flex size-7 items-center justify-center rounded-[10px] transition-all duration-300 disabled:cursor-not-allowed disabled:bg-foreground/10 enabled:bg-foreground enabled:hover:scale-105 enabled:hover:bg-foreground/90 text-background"
+                aria-label="发送"
               >
-                {isSubmitting ? "准备项目中..." : "免费开始"}
-                <ArrowRight className="size-4" />
+                {isSubmitting ? (
+                  <Square className="size-5" />
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg>
+                )}
               </button>
             </div>
 
@@ -280,6 +284,7 @@ export default function HomeClient({
                             src={profile.avatar_url}
                             alt={profile.username || "Avatar"}
                             fill
+                            sizes="32px"
                             className="object-cover"
                           />
                         </div>

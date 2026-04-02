@@ -1149,7 +1149,7 @@ export function WorkbenchContent() {
             <span className="text-white font-bold italic text-xs">A</span>
           </div>
           <span className="text-foreground font-bold text-sm tracking-wide">
-            ATOMS
+            VORTEX
           </span>
         </Link>
 
@@ -1344,7 +1344,7 @@ export function WorkbenchContent() {
                 {serverUrl ? (
                   <iframe
                     key={`${serverUrl}-${previewRefreshSeed}`}
-                    title="ATOMS Preview"
+                    title="VORTEX Preview"
                     src={serverUrl}
                     className="w-full h-full border-0"
                   />
