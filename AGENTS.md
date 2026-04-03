@@ -147,6 +147,7 @@ JSONB 虚拟文件系统： 数据库中不存单文件文本，而是使用 JSO
 - `profiles` 通过触发器 `set_profiles_updated_at`（函数 `public.set_profile_updated_at()`）在更新时自动刷新 `updated_at`。
 - 工程师/调试节点产出文件后，后端必须在同一轮流程中对 `project_files` 执行增量 upsert（仅写入有改动的文件），不得仅依赖前端防抖保存。
 - 产出文件落库后，需将最新 `updated_at` 回传前端并刷新本地时间戳，避免后续编辑出现伪冲突或持久化延迟。
+- Agent 最终快照如果已由后端完成 `project_files` 落库，前端收到 SSE 结果后只应用本地状态与时间戳，不得对同一批 Agent 文件再次发起 `/api/projects/[id]/files` 二次保存，以避免伪冲突。
 - 当前产品未提供显式 session 切换器，因此同一项目默认只复用一个活跃会话；后端在缺少 `sessionId` 时必须优先复用该项目最近活跃的 `chat_sessions`，不得无条件新建额外 session。
 - 前端字段读取契约：
 	- 用户资料：`profiles(email, username, avatar_url)`。

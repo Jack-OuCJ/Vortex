@@ -475,9 +475,9 @@ export function WorkbenchContent() {
         payload.conflicts.forEach((conflict) => {
           upsertStep({
             id: `server-conflict:${conflict.path}`,
-            title: "服务端冲突拦截",
+            title: "保存前需确认版本",
             status: "error",
-            detail: `${conflict.path} 已在其他会话更新，请刷新后重试`,
+            detail: `${conflict.path} 的服务端版本已变化，请先确认后再保存`,
           });
         });
       }
@@ -1028,37 +1028,16 @@ export function WorkbenchContent() {
                     continue;
                   }
 
-                  upsertStep({
-                    id: "sync-agent-files",
-                    title: "同步 Agent 文件",
-                    status: "running",
-                    detail: `正在回写 ${syncPaths.length} 个 Agent 变更文件...`,
+                  syncPaths.forEach((path) => {
+                    dirtyFilePathsRef.current.delete(path);
                   });
-                  void syncProjectFilesToServer(syncFilesSnapshot, deletedPaths)
-                    .then((syncResult) => {
-                      if (syncResult.ok) {
-                        [...syncResult.updatedPaths, ...syncResult.deletedPaths, ...syncResult.conflictPaths].forEach((path) => {
-                          dirtyFilePathsRef.current.delete(path);
-                        });
-                      }
 
-                      upsertStep({
-                        id: "sync-agent-files",
-                        title: "同步 Agent 文件",
-                        status: syncResult.ok ? "done" : "error",
-                        detail: syncResult.ok
-                          ? `已同步 ${syncPaths.length} 个 Agent 变更到数据库`
-                          : syncResult.error || "同步数据库失败，请稍后重试",
-                      });
-                    })
-                    .catch((err: unknown) => {
-                      upsertStep({
-                        id: "sync-agent-files",
-                        title: "同步 Agent 文件",
-                        status: "error",
-                        detail: err instanceof Error ? err.message : "写回数据库失败",
-                      });
-                    });
+                  upsertStep({
+                    id: "apply-agent-files",
+                    title: "应用 Agent 结果",
+                    status: "done",
+                    detail: `已在工作台应用 ${syncPaths.length} 个 Agent 变更`,
+                  });
                 }
               }
             } catch {
