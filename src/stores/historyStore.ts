@@ -12,6 +12,7 @@ type HistoryStore = {
   isLoading: boolean;
   fetchProjects: (userId: string) => Promise<void>;
   updateProjectName: (projectId: string, newName: string) => Promise<void>;
+  patchLocalProjectName: (projectId: string, newName: string) => void;
   deleteProject: (projectId: string) => Promise<void>;
 };
 
@@ -67,6 +68,14 @@ export const useHistoryStore = create<HistoryStore>((set) => ({
     } catch (err) {
       console.error("Failed to rename project:", err);
     }
+  },
+
+  patchLocalProjectName: (projectId: string, newName: string) => {
+    set((state) => ({
+      projects: state.projects.map((p) =>
+        p.id === projectId ? { ...p, name: newName } : p
+      ),
+    }));
   },
 
   deleteProject: async (projectId: string) => {

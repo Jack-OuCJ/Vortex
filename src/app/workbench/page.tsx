@@ -1,19 +1,26 @@
 "use client";
 
-import React, { Suspense, useState, useEffect, useCallback, useRef } from "react";
+import React, { Suspense, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { motion } from "framer-motion";
-import { RefreshCw, Send, Square } from "lucide-react";
+import { Atom, Check, PanelLeft, RefreshCw, Square, X } from "lucide-react";
+import Lottie from "lottie-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
+import liveChatbotAnimation from "../../../public/anim/Live chatbot.json";
 import { MonacoCodeEditor } from "@/components/MonacoCodeEditor";
+import { SidebarDrawer } from "@/components/SidebarAndHeader";
+import { WorkbenchFileTree } from "@/components/WorkbenchFileTree";
 import { WorkflowAccordion } from "@/components/WorkflowAccordion";
 import { useWebContainer } from "@/hooks/useWebContainer";
 import { AGENT_AVATAR_MAP, AGENT_ROLE_LABEL_MAP } from "@/lib/agent-meta";
-import { formatWorkflowToolTitle } from "@/lib/workflow";
+import { formatDisplayPath, formatWorkflowToolTitle } from "@/lib/workflow";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useChatStore } from "@/stores/chatStore";
 import { useProjectStore } from "@/stores/projectStore";
 import { useUiStore } from "@/stores/uiStore";
+import { useHistoryStore } from "@/stores/historyStore";
 import type { WebContainerBridgeRequest, WebContainerBridgeResult, WebContainerToolInputMap, WebContainerToolName } from "@/lib/webcontainer-bridge";
 
 type ProjectSummary = {
@@ -86,7 +93,12 @@ type WebContainerRequestStreamEvent = {
   request: WebContainerBridgeRequest;
 };
 
-type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent | WebContainerRequestStreamEvent;
+type ProjectRenameStreamEvent = {
+  eventType: "project_rename";
+  name: string;
+};
+
+type StreamEvent = AgentStreamEvent | SessionStreamEvent | StepStreamEvent | ToolStreamEvent | WebContainerRequestStreamEvent | ProjectRenameStreamEvent;
 
 const isThinkingOrStreaming = (status?: "thinking" | "done" | "error" | "streaming") =>
   status === "thinking" || status === "streaming";
@@ -101,6 +113,29 @@ const buildMergeCandidate = (localContent: string, serverContent: string, server
   ].join("\n");
 };
 
+const formatStepPathLabel = (path: string) => {
+  return formatDisplayPath(path);
+};
+
+const getParentDirectoryPaths = (path: string) => {
+  const segments = path.split("/").filter(Boolean);
+  return segments.slice(0, -1).map((_, index) => `/${segments.slice(0, index + 1).join("/")}`);
+};
+
+function WorkbenchLoadingState() {
+  return (
+    <div className="h-full w-full flex items-center justify-center px-6">
+      <div className="flex items-center justify-center">
+        <Lottie
+          animationData={liveChatbotAnimation}
+          loop
+          className="h-56 w-56 sm:h-72 sm:w-72"
+        />
+      </div>
+    </div>
+  );
+}
+
 export function WorkbenchContent() {
   const {
     activeTab,
@@ -108,7 +143,10 @@ export function WorkbenchContent() {
     sidebarWidth,
     setSidebarWidth,
     steps,
+    expandedDirectories,
     resetSteps,
+    toggleDirectory,
+    expandDirectories,
     upsertStep,
   } = useUiStore();
   const {
@@ -144,23 +182,65 @@ export function WorkbenchContent() {
     loadHistory,
     resetMessages,
   } = useChatStore();
+  const { patchLocalProjectName } = useHistoryStore();
 
   const [nowTs, setNowTs] = useState<number | null>(null);
   const [previewRefreshSeed, setPreviewRefreshSeed] = useState(0);
-  
+  const [isHomeSidebarPinned, setIsHomeSidebarPinned] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const saveTimerRef = useRef<number | null>(null);
   const lastManualEditAtRef = useRef<Record<string, number>>({});
   const dirtyFilePathsRef = useRef<Set<string>>(new Set());
+  const [pendingEdits, setPendingEdits] = useState<Record<string, string>>({});
   const autoPromptConsumedRef = useRef(false);
 
   const router = useRouter();
   const searchParams = useSearchParams();
   const searchParamsKey = searchParams.toString();
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    setIsHomeSidebarPinned(window.localStorage.getItem("sidebarPinned") === "true");
+  }, []);
+
+  const loadPendingHomeAttachments = useCallback((targetProjectId: string) => {
+    if (typeof window === "undefined") {
+      return [] as Array<{ name: string; content: string; mimeType: string }>;
+    }
+
+    const storageKey = `pending-home-attachments:${targetProjectId}`;
+    const storedValue = window.sessionStorage.getItem(storageKey);
+    window.sessionStorage.removeItem(storageKey);
+
+    if (!storedValue) {
+      return [] as Array<{ name: string; content: string; mimeType: string }>;
+    }
+
+    try {
+      const parsed = JSON.parse(storedValue);
+      if (!Array.isArray(parsed)) {
+        return [] as Array<{ name: string; content: string; mimeType: string }>;
+      }
+
+      return parsed.filter((item): item is { name: string; content: string; mimeType: string } => {
+        return Boolean(
+          item
+            && typeof item === "object"
+            && typeof item.name === "string"
+            && typeof item.content === "string"
+            && typeof item.mimeType === "string"
+        );
+      });
+    } catch {
+      return [] as Array<{ name: string; content: string; mimeType: string }>;
+    }
+  }, []);
+
   const {
     isReady: isContainerReady,
     serverUrl,
-    logs,
     syncFiles,
     writeFile,
     readFile,
@@ -180,7 +260,7 @@ export function WorkbenchContent() {
           const content = await readFile(input.path);
           return {
             ok: true,
-            detail: `${input.path} 已读取 (${content.length} 字符)`,
+            detail: `${formatStepPathLabel(input.path)} 已读取`,
             data: { path: input.path, content },
           };
         }
@@ -189,7 +269,7 @@ export function WorkbenchContent() {
           await writeFile(input.path, input.content);
           return {
             ok: true,
-            detail: `${input.path} 已写入 (${input.content.length} 字符)`,
+            detail: `${formatStepPathLabel(input.path)} 已写入`,
             data: { path: input.path, length: input.content.length },
           };
         }
@@ -198,7 +278,7 @@ export function WorkbenchContent() {
           const entries = await readDir(input.path);
           return {
             ok: true,
-            detail: `${input.path} 已列出 (${entries.length} 项)`,
+            detail: `${formatStepPathLabel(input.path)} 已列出 (${entries.length} 项)`,
             data: { path: input.path, entries },
           };
         }
@@ -207,7 +287,7 @@ export function WorkbenchContent() {
           await makeDir(input.path);
           return {
             ok: true,
-            detail: `${input.path} 已创建目录`,
+            detail: `${formatStepPathLabel(input.path)} 已创建目录`,
             data: { path: input.path },
           };
         }
@@ -216,7 +296,7 @@ export function WorkbenchContent() {
           await removePath(input.path, { recursive: input.recursive === true });
           return {
             ok: true,
-            detail: `${input.path} 已删除`,
+            detail: `${formatStepPathLabel(input.path)} 已删除`,
             data: { path: input.path, recursive: input.recursive === true },
           };
         }
@@ -292,6 +372,7 @@ export function WorkbenchContent() {
   const syncProjectFilesToServer = useCallback(
     async (filesSnapshot: Record<string, string>, deletedPaths: string[] = []) => {
       if (!projectId) {
+        console.warn("[syncProjectFilesToServer] projectId 为空，跳过同步");
         return {
           ok: false,
           error: "项目尚未初始化",
@@ -308,6 +389,8 @@ export function WorkbenchContent() {
         content,
         expectedUpdatedAt: fileTimestamps[path] ?? null,
       }));
+
+      console.log("[syncProjectFilesToServer] 开始同步", { projectId, files: files.map(f => ({ path: f.path, expectedUpdatedAt: f.expectedUpdatedAt })) });
 
       if (!files.length && !deletedPaths.length) {
         return {
@@ -607,55 +690,9 @@ export function WorkbenchContent() {
     if (!projectId || isBootstrapping) {
       return;
     }
-
-    if (!dirtyFilePathsRef.current.size) {
-      return;
-    }
-
-    if (saveTimerRef.current) {
-      window.clearTimeout(saveTimerRef.current);
-    }
-
-    saveTimerRef.current = window.setTimeout(() => {
-      const dirtyPaths = Array.from(dirtyFilePathsRef.current);
-      const dirtySnapshot = dirtyPaths.reduce<Record<string, string>>((acc, path) => {
-        const content = projectFiles[path];
-        if (typeof content === "string") {
-          acc[path] = content;
-        }
-        return acc;
-      }, {});
-      const deletedPaths = dirtyPaths.filter((path) => typeof projectFiles[path] !== "string");
-
-      if (!Object.keys(dirtySnapshot).length && !deletedPaths.length) {
-        return;
-      }
-
-      void syncProjectFilesToServer(dirtySnapshot, deletedPaths)
-        .then((result) => {
-          if (!result.ok) {
-            return;
-          }
-
-          [...result.updatedPaths, ...result.deletedPaths, ...result.conflictPaths].forEach((path) => {
-            dirtyFilePathsRef.current.delete(path);
-          });
-        })
-        .catch(() => {
-          // noop
-        });
-    }, 1000);
-
-    return () => {
-      if (saveTimerRef.current) {
-        window.clearTimeout(saveTimerRef.current);
-      }
-    };
   }, [
     isBootstrapping,
-    projectFiles,
     projectId,
-    syncProjectFilesToServer,
   ]);
 
   useEffect(() => {
@@ -668,7 +705,11 @@ export function WorkbenchContent() {
 
   const sendMessage = useCallback(async (
     rawMessage: string,
-    options?: { isNewProject?: boolean; clearInput?: boolean }
+    options?: {
+      isNewProject?: boolean;
+      clearInput?: boolean;
+      attachmentsOverride?: Array<{ name: string; content: string; mimeType: string }>;
+    }
   ) => {
     const userMsg = rawMessage.trim();
     if (!userMsg || isGenerating) return;
@@ -699,14 +740,16 @@ export function WorkbenchContent() {
       const hotFilePaths = Array.from(
         new Set([
           activeFilePath,
+          ...Object.keys(pendingEdits),
           ...Array.from(dirtyFilePathsRef.current),
           ...recentEditedPaths,
-        ].filter((path): path is string => Boolean(path && typeof projectFiles[path] === "string")))
+        ].filter((path): path is string => Boolean(path && typeof displayFiles[path] === "string")))
       ).slice(0, 6);
 
       const hotFiles = hotFilePaths.map((path) => ({
+        // pendingEdits 包含草稿内容，优先用草稿传给 AI
         path,
-        code: projectFiles[path],
+        code: displayFiles[path],
       }));
 
       const fileTree = Object.entries(projectFiles)
@@ -717,10 +760,12 @@ export function WorkbenchContent() {
             path,
             size: code.length,
             isActive: path === activeFilePath,
-            isDirty: dirtyFilePathsRef.current.has(path),
+            isDirty: (path in pendingEdits) || dirtyFilePathsRef.current.has(path),
             isRecentlyEdited: lastEditedAt > 0 && now - lastEditedAt < 10 * 60 * 1000,
           };
         });
+
+      const currentAttachments = options?.attachmentsOverride ?? [];
 
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -732,6 +777,7 @@ export function WorkbenchContent() {
           projectId,
           sessionId,
           isNewProject: options?.isNewProject === true,
+          attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -830,7 +876,15 @@ export function WorkbenchContent() {
 
                 continue;
               }
-              
+
+              if (data.eventType === "project_rename") {
+                if (projectId) {
+                  setProjectMeta(projectId, data.name);
+                  patchLocalProjectName(projectId, data.name);
+                }
+                continue;
+              }
+
               const agentData = data as AgentStreamEvent;
 
               const avatar = AGENT_AVATAR_MAP[agentData.agent] || AGENT_AVATAR_MAP.engineer;
@@ -1020,15 +1074,18 @@ export function WorkbenchContent() {
       return;
     }
 
+    const initialAttachments = loadPendingHomeAttachments(projectId);
+
     autoPromptConsumedRef.current = true;
     void sendMessage(initialPrompt, {
       isNewProject: searchParams.get("newProject") === "true",
       clearInput: true,
+      attachmentsOverride: initialAttachments,
     });
 
     // 清除临时 prompt 参数，但保留当前项目 id，避免 bootstrap 重置会话
     router.replace(`/workbench?project_id=${projectId}`);
-  }, [isBootstrapping, isContainerReady, projectId, router, searchParams, sendMessage]);
+  }, [isBootstrapping, isContainerReady, loadPendingHomeAttachments, projectId, router, searchParams, sendMessage]);
 
   const handleSend = async () => {
     await sendMessage(inputValue, { clearInput: true });
@@ -1067,13 +1124,70 @@ export function WorkbenchContent() {
     };
   }, [resize, stopResizing]);
 
-  const sortedFilePaths = Object.keys(projectFiles).sort();
+  useEffect(() => {
+    if (!activeFilePath) {
+      return;
+    }
+
+    expandDirectories(getParentDirectoryPaths(activeFilePath));
+  }, [activeFilePath, expandDirectories]);
+
+  const displayFiles = useMemo(
+    () => ({ ...projectFiles, ...pendingEdits }),
+    [projectFiles, pendingEdits],
+  );
+
+  const isCurrentFileDirty =
+    activeFilePath !== null &&
+    activeFilePath !== undefined &&
+    activeFilePath in pendingEdits &&
+    pendingEdits[activeFilePath] !== (projectFiles[activeFilePath] ?? "");
+
+  const pendingPathsSet = useMemo(
+    () =>
+      new Set(
+        Object.entries(pendingEdits)
+          .filter(([path, draft]) => draft !== (projectFiles[path] ?? ""))
+          .map(([path]) => path),
+      ),
+    [pendingEdits, projectFiles],
+  );
 
   const handleEditorChange = (path: string, nextCode: string) => {
     lastManualEditAtRef.current[path] = Date.now();
-    markDirtyPaths([path]);
-    updateActiveFile(path, nextCode);
-    void writeFile(path, nextCode);
+    setPendingEdits((prev) => ({ ...prev, [path]: nextCode }));
+  };
+
+  const handleConfirmEdit = async () => {
+    if (!activeFilePath) return;
+    const content = pendingEdits[activeFilePath];
+    if (typeof content !== "string") return;
+    updateActiveFile(activeFilePath, content);
+    void writeFile(activeFilePath, content);
+    setPendingEdits((prev) => {
+      const next = { ...prev };
+      delete next[activeFilePath];
+      return next;
+    });
+    try {
+      const result = await syncProjectFilesToServer({ [activeFilePath]: content });
+      if (!result.ok) {
+        console.error("[handleConfirmEdit] 保存失败:", result.error);
+      } else {
+        console.log("[handleConfirmEdit] 保存成功:", activeFilePath);
+      }
+    } catch (err) {
+      console.error("[handleConfirmEdit] 保存异常:", err);
+    }
+  };
+
+  const handleCancelEdit = () => {
+    if (!activeFilePath) return;
+    setPendingEdits((prev) => {
+      const next = { ...prev };
+      delete next[activeFilePath];
+      return next;
+    });
   };
 
   const handleRefreshPreview = () => {
@@ -1130,7 +1244,7 @@ export function WorkbenchContent() {
   }, -1);
 
   return (
-    <div className="flex w-full h-screen bg-background text-foreground font-sans overflow-hidden">
+    <div className={`flex w-full h-screen bg-background text-foreground font-sans overflow-hidden transition-all duration-300 ${isHomeSidebarPinned ? "pl-64" : ""} ${isResizing ? "select-none" : ""}`}>
       {/* --- Left Sidebar (Agent Workspace) --- */}
       <motion.div
         initial={{ x: "-100%", opacity: 0 }}
@@ -1140,22 +1254,47 @@ export function WorkbenchContent() {
         style={{ width: `${sidebarWidth}%` }}
       >
         <div
-          onMouseDown={startResizing}
+          onMouseDown={(e) => { e.preventDefault(); startResizing(); }}
           className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-blue-500/50 transition-colors z-50"
         />
         {/* Header Logo */}
-        <Link href="/" className="px-5 mb-5 flex items-center gap-1.5 hover:opacity-80 transition-opacity cursor-pointer">
-          <div className="w-[26px] h-[26px] rounded-full bg-blue-600 flex items-center justify-center shadow-sm">
-            <span className="text-white font-bold italic text-xs">A</span>
-          </div>
-          <span className="text-foreground font-bold text-sm tracking-wide">
-            VORTEX
-          </span>
-        </Link>
-
-        <div className="px-6 pb-2 text-xs text-muted-foreground/70 truncate">
-          {projectName}
+        <div className="px-5 mb-5 flex items-center gap-2.5">
+          {isHomeSidebarPinned ? (
+            <div className="px-1 text-sm font-medium text-foreground/80 truncate">
+              {projectName}
+            </div>
+          ) : (
+            <Link href="/" className="flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer group">
+              <Atom className="size-5 text-foreground transition-transform duration-300 group-hover:scale-105" />
+              <span className="text-foreground font-semibold text-[15px] tracking-tight">
+                Vortex
+              </span>
+            </Link>
+          )}
+          <SidebarDrawer
+            user={null}
+            profile={null}
+            onSidebarChange={setIsHomeSidebarPinned}
+            renderTrigger={({ openSidebar, isPinned }) => (
+              isPinned ? null : (
+                <button
+                  onMouseEnter={openSidebar}
+                  onClick={openSidebar}
+                  className="opacity-40 hover:opacity-100 transition-opacity p-1.5 -ml-1 select-none flex items-center justify-center cursor-pointer rounded-md"
+                  aria-label="打开侧边栏"
+                >
+                  <PanelLeft className="size-4.5" />
+                </button>
+              )
+            )}
+          />
         </div>
+
+        {!isHomeSidebarPinned && (
+          <div className="px-6 pb-2 text-xs text-muted-foreground/70 truncate">
+            {projectName}
+          </div>
+        )}
 
         {!!conflictList.length && (
           <div className="px-6 pb-3 space-y-2">
@@ -1216,7 +1355,7 @@ export function WorkbenchContent() {
                     <div className="flex items-end mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                       <span className="text-[11px] text-muted-foreground/50 mb-4">{timeStr}</span>
                     </div>
-                    <div className="text-sm text-foreground/90 bg-muted/80 p-4 rounded-2xl rounded-tr-none border border-border/50 max-w-[85%] whitespace-pre-wrap leading-relaxed">
+                    <div className="text-xs text-foreground/90 bg-muted/80 p-4 rounded-2xl rounded-tr-none border border-border/50 max-w-[85%] whitespace-pre-wrap leading-relaxed break-words">
                       {msg.content}
                     </div>
                   </div>
@@ -1231,7 +1370,7 @@ export function WorkbenchContent() {
                         sizes="36px"
                       />
                     </div>
-                    <div className="flex-1">
+                    <div className="flex-1 min-w-0">
                       {(() => {
                         const workflowSteps = idx === latestAgentMessageIndex && steps.length
                           ? steps
@@ -1250,8 +1389,8 @@ export function WorkbenchContent() {
                         </span>
                       </div>
                       <WorkflowAccordion steps={workflowSteps} />
-                      <div className={`text-sm text-foreground/90 leading-relaxed bg-background p-4 rounded-2xl rounded-tl-none border border-border/60 shadow-sm mt-2 ${msg.status === 'thinking' ? 'animate-pulse' : ''} ${msg.status === 'streaming' ? 'border-primary/50 bg-muted/20' : ''}`}>
-                        {msg.content}
+                      <div className={`text-xs text-foreground/90 leading-relaxed bg-background p-4 rounded-2xl rounded-tl-none border border-border/60 shadow-sm mt-2 prose prose-xs prose-invert max-w-none break-words ${msg.status === 'thinking' ? 'animate-pulse' : ''} ${msg.status === 'streaming' ? 'border-primary/50 bg-muted/20' : ''}`}>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                       </div>
                           </>
                         );
@@ -1266,19 +1405,9 @@ export function WorkbenchContent() {
           <div ref={messagesEndRef} className="h-8 pb-10 shrink-0" />
         </div>
 
-        {/* Suggestion Pills */}
-        <div className="px-6 py-4 flex flex-wrap gap-2">
-          <button className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors backdrop-blur-sm">
-            Add mood tracker
-          </button>
-          <button className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors backdrop-blur-sm">
-            Add calming animation
-          </button>
-        </div>
-
         {/* Input Area */}
         <div className="p-4 border-t border-border bg-background">
-          <div className="relative bg-muted/30 rounded-2xl border border-border focus-within:border-blue-500/50 transition-colors overflow-hidden flex flex-col">
+          <div className="relative bg-muted/30 rounded-2xl border border-border focus-within:border-blue-500/50 transition-colors flex flex-col">
             <textarea
               className="w-full bg-transparent text-sm text-foreground p-4 pb-12 outline-none resize-none placeholder-muted-foreground"
               rows={3}
@@ -1288,16 +1417,13 @@ export function WorkbenchContent() {
               onKeyDown={handleKeyDown}
             />
             <div className="absolute right-3 bottom-3 flex items-center gap-2">
-              <button 
+              <button
                 onClick={isGenerating ? handleStop : handleSend}
-                className={`p-2 rounded-xl text-white transition-all flex items-center justify-center shadow-lg active:scale-95 ${
-                  isGenerating
-                    ? "bg-red-500 hover:bg-red-600 hover:scale-95 shadow-red-900/20"
-                    : "bg-blue-600 hover:bg-blue-500 hover:scale-105 shadow-blue-900/20"
-                }`}
+                disabled={!isGenerating && inputValue.trim().length === 0}
+                className="inline-flex size-7 items-center justify-center rounded-[10px] transition-all duration-300 disabled:cursor-not-allowed disabled:bg-foreground/10 enabled:bg-foreground enabled:hover:scale-105 enabled:hover:bg-foreground/90 text-background"
                 title={isGenerating ? "停止生成" : "发送"}
               >
-                {isGenerating ? <Square className="w-4 h-4 fill-current" /> : <Send className="w-4 h-4" />}
+                {isGenerating ? <Square className="size-4 fill-current" /> : <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg>}
               </button>
             </div>
           </div>
@@ -1317,26 +1443,46 @@ export function WorkbenchContent() {
             {activeTab === "code" ? (
               <div className="flex h-full">
                 <div className="w-64 border-r border-border/60 bg-muted/20 overflow-y-auto">
-                  {sortedFilePaths.map((path) => (
-                    <button
-                      key={path}
-                      onClick={() => setActiveFilePath(path)}
-                      className={`w-full text-left px-3 py-2 text-xs transition-colors border-b border-border/30 ${
-                        path === activeFilePath
-                          ? "bg-blue-500/15 text-foreground"
-                          : "text-muted-foreground hover:bg-muted/40"
-                      }`}
-                    >
-                      {path}
-                    </button>
-                  ))}
-                </div>
-                <div className="flex-1">
-                  <MonacoCodeEditor
-                    activePath={activeFilePath}
+                  <WorkbenchFileTree
+                    activeFilePath={activeFilePath}
+                    expandedDirectories={expandedDirectories}
                     files={projectFiles}
-                    onCodeChange={handleEditorChange}
+                    pendingPaths={pendingPathsSet}
+                    onSelectFile={setActiveFilePath}
+                    onToggleDirectory={toggleDirectory}
                   />
+                </div>
+                <div className="flex-1 flex flex-col overflow-hidden">
+                  {isCurrentFileDirty && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/40 bg-muted/20 shrink-0">
+                      <span className="text-xs text-muted-foreground flex-1 truncate">
+                        {activeFilePath} — 有未保存的更改
+                      </span>
+                      <button
+                        onClick={() => void handleConfirmEdit()}
+                        title="确认保存"
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-600 hover:bg-green-500/20 transition-colors"
+                      >
+                        <Check size={13} />
+                        保存
+                      </button>
+                      <button
+                        onClick={handleCancelEdit}
+                        title="丢弃更改"
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-muted/50 text-muted-foreground hover:bg-muted transition-colors"
+                      >
+                        <X size={13} />
+                        放弃
+                      </button>
+                    </div>
+                  )}
+                  <div className="flex-1 overflow-hidden">
+                    <MonacoCodeEditor
+                      activePath={activeFilePath}
+                      files={displayFiles}
+                      onCodeChange={handleEditorChange}
+                    />
+                  </div>
                 </div>
               </div>
             ) : (
@@ -1349,19 +1495,7 @@ export function WorkbenchContent() {
                     className="w-full h-full border-0"
                   />
                 ) : (
-                  <div className="h-full w-full flex flex-col items-center justify-center text-sm text-muted-foreground px-6 text-center gap-3">
-                    <p>正在启动 WebContainer 运行时...</p>
-                    <p className="text-xs text-muted-foreground/70">
-                      {isContainerReady ? "容器已启动，正在安装依赖并启动开发服务器" : "正在初始化容器内核"}
-                    </p>
-                    {!!logs.length && (
-                      <div className="max-w-3xl w-full bg-black/80 text-green-300 rounded-lg p-3 text-left text-xs overflow-auto max-h-36">
-                        {logs.slice(-8).map((line, idx) => (
-                          <div key={idx}>{line}</div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                  <WorkbenchLoadingState />
                 )}
               </div>
             )}

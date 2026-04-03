@@ -28,6 +28,50 @@ const GENERATED_RUNTIME_FILES = new Set([
   "tsconfig.tsbuildinfo",
 ]);
 
+const PREVIEW_SCROLL_GUARD_MARKER = "data-vortex-preview-scroll-guard";
+
+const PREVIEW_SCROLL_GUARD_SCRIPT = [
+  `<script ${PREVIEW_SCROLL_GUARD_MARKER}="true">`,
+  "(() => {",
+  "  const blockedKeys = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ']);",
+  "",
+  "  const isEditableTarget = (target) => {",
+  "    if (!(target instanceof HTMLElement)) return false;",
+  "    const tagName = target.tagName;",
+  "    return target.isContentEditable || tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';",
+  "  };",
+  "",
+  "  window.addEventListener('keydown', (event) => {",
+  "    if (event.defaultPrevented || !blockedKeys.has(event.key) || isEditableTarget(event.target)) {",
+  "      return;",
+  "    }",
+  "",
+  "    event.preventDefault();",
+  "  }, { passive: false });",
+  "})();",
+  "<\/script>",
+].join('');
+
+const injectPreviewScrollGuard = (content: string): string => {
+  if (content.includes(PREVIEW_SCROLL_GUARD_MARKER)) {
+    return content;
+  }
+
+  if (content.includes("</head>")) {
+    return content.replace("</head>", `${PREVIEW_SCROLL_GUARD_SCRIPT}</head>`);
+  }
+
+  return `${PREVIEW_SCROLL_GUARD_SCRIPT}${content}`;
+};
+
+const toRuntimeFileContents = (runtimePath: string, content: string): string => {
+  if (runtimePath === "index.html") {
+    return injectPreviewScrollGuard(content);
+  }
+
+  return content;
+};
+
 // ---------------------------------------------------------------------------
 // 基础文件树（模板）
 // ---------------------------------------------------------------------------
@@ -68,8 +112,10 @@ export const WEBCONTAINER_TEMPLATE: FileSystemTree = {
 
   "index.html": {
     file: {
-      contents:
-        '<!doctype html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>VORTEX Preview</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>',
+      contents: toRuntimeFileContents(
+        "index.html",
+        '<!doctype html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>VORTEX Preview</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>'
+      ),
     },
   },
 
@@ -156,9 +202,6 @@ export const WEBCONTAINER_TEMPLATE: FileSystemTree = {
             "  return (",
             "    <div className=\"min-h-screen bg-slate-50 flex items-center justify-center\">",
             "      <div className=\"text-center p-8\">",
-            "        <div className=\"w-12 h-12 rounded-full bg-blue-600 flex items-center justify-center mx-auto mb-4\">",
-            "          <span className=\"text-white font-bold italic text-lg\">A</span>",
-            "        </div>",
             "        <h2 className=\"text-slate-800 text-xl font-semibold mb-2\">Ready to build</h2>",
             "        <p className=\"text-slate-500 text-sm\">Describe your app in the chat →</p>",
             "      </div>",
@@ -234,6 +277,7 @@ export const toRuntimeTree = (files: FilesMap): FileSystemTree => {
   for (const [logicalPath, content] of Object.entries(files)) {
     const runtimePath = toRuntimePath(logicalPath);
     const segments = runtimePath.split("/").filter(Boolean);
+    const runtimeContent = toRuntimeFileContents(runtimePath, content);
     let cursor = tree;
 
     for (let index = 0; index < segments.length - 1; index += 1) {
@@ -247,7 +291,7 @@ export const toRuntimeTree = (files: FilesMap): FileSystemTree => {
       cursor = (cursor[segment] as DirectoryNode).directory;
     }
 
-    cursor[segments[segments.length - 1]] = { file: { contents: content } };
+    cursor[segments[segments.length - 1]] = { file: { contents: runtimeContent } };
   }
 
   return tree;

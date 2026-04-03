@@ -4,13 +4,18 @@ import type { WorkflowStep, WorkflowStepStatus, WorkflowToolName } from "@/lib/w
 const HIDDEN_STEP_IDS = new Set<string>([]);
 const HIDDEN_STEP_TITLES = new Set<string>([]);
 
+type ExpandedDirectories = Record<string, true>;
+
 type UiStore = {
   activeTab: "preview" | "code";
   sidebarWidth: number;
   currentRound: number;
   steps: WorkflowStep[];
+  expandedDirectories: ExpandedDirectories;
   setActiveTab: (tab: "preview" | "code") => void;
   setSidebarWidth: (sidebarWidth: number) => void;
+  toggleDirectory: (path: string) => void;
+  expandDirectories: (paths: string[]) => void;
   resetSteps: () => void;
   upsertStep: (step: {
     id: string;
@@ -27,8 +32,44 @@ export const useUiStore = create<UiStore>((set) => ({
   sidebarWidth: 25,
   currentRound: 0,
   steps: [],
+  expandedDirectories: {},
   setActiveTab: (activeTab) => set({ activeTab }),
   setSidebarWidth: (sidebarWidth) => set({ sidebarWidth }),
+  toggleDirectory: (path) =>
+    set((state) => {
+      if (state.expandedDirectories[path]) {
+        const next = { ...state.expandedDirectories };
+        delete next[path];
+        return { expandedDirectories: next };
+      }
+
+      return {
+        expandedDirectories: {
+          ...state.expandedDirectories,
+          [path]: true,
+        },
+      };
+    }),
+  expandDirectories: (paths) =>
+    set((state) => {
+      if (!paths.length) {
+        return state;
+      }
+
+      let changed = false;
+      const next = { ...state.expandedDirectories };
+
+      paths.forEach((path) => {
+        if (!path || next[path]) {
+          return;
+        }
+
+        next[path] = true;
+        changed = true;
+      });
+
+      return changed ? { expandedDirectories: next } : state;
+    }),
   resetSteps: () =>
     set((state) => ({
       currentRound: state.currentRound + 1,

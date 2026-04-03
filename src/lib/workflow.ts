@@ -26,8 +26,8 @@ export type WorkflowStep = {
 };
 
 const TOOL_TITLE_MAP: Record<WorkflowToolName, string> = {
-  route_request: "工具: route_request",
-  execute_task: "工具: execute_task",
+  route_request: "任务分析",
+  execute_task: "任务执行",
   "wc.fs.readFile": "读取文件",
   "wc.fs.writeFile": "写入文件",
   "wc.fs.readdir": "读取目录",
@@ -44,6 +44,25 @@ const isWorkflowStatus = (value: unknown): value is WorkflowStepStatus => {
 
 const isWorkflowSource = (value: unknown): value is WorkflowStepSource => {
   return value === "step" || value === "tool";
+};
+
+export const formatDisplayPath = (path: string) => {
+  const normalized = path.trim();
+
+  if (!normalized || normalized === "/") {
+    return "根目录";
+  }
+
+  const segments = normalized.split("/").filter(Boolean);
+  return segments[segments.length - 1] ?? normalized;
+};
+
+export const stripWorkflowPathDecorations = (value?: string) => {
+  if (!value) {
+    return value;
+  }
+
+  return value.replace(/\/(?:[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*)/g, (match) => formatDisplayPath(match));
 };
 
 export const formatWorkflowToolTitle = (toolName: WorkflowToolName) => {

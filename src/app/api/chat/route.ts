@@ -95,6 +95,16 @@ type RequestFileTreeItem = {
   isRecentlyEdited?: boolean;
 };
 
+type AttachmentItem = {
+  name: string;
+  content: string;
+  mimeType: string;
+};
+
+const ALLOWED_MODELS = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"] as const;
+type AllowedModel = (typeof ALLOWED_MODELS)[number];
+const DEFAULT_MODEL: AllowedModel = "MiniMax-M2.7";
+
 type RequestBody = {
   message?: string;
   errorMessage?: string;
@@ -104,6 +114,8 @@ type RequestBody = {
   projectId?: string;
   sessionId?: string;
   isNewProject?: boolean;
+  attachments?: AttachmentItem[];
+  model?: string;
 };
 
 type EngineerRouteDecision = {
@@ -153,6 +165,8 @@ type FileToolLoopResult = {
   projectFiles: ProjectFile[];
   summary?: string;
   finalized: boolean;
+  interrupted: boolean;
+  interruptionDetail?: string;
 };
 
 type ToolCallInput = Extract<ToolLoopDecision, { action: "tool_call" }>[
@@ -173,6 +187,8 @@ const PROJECT_ROOT_PATH = path.resolve(process.cwd());
 const DEBUG_DIR_PATH = path.join(PROJECT_ROOT_PATH, ".debug");
 const DEBUG_LOG_PATH = path.join(DEBUG_DIR_PATH, "alex-tool-loop.ndjson");
 let debugLogPathAnnounced = false;
+
+const TOOL_LOOP_ROUND_MAX_DURATION_MS = 1000000;
 
 const serializeDebugLogEntry = (entry: DebugLogEntry) => {
   return `${JSON.stringify({ ...entry, timestamp: new Date().toISOString() })}\n`;
@@ -224,7 +240,12 @@ const extractProcessSnapshot = (result: WebContainerBridgeResult) => {
 
 const parseJSONFromLLM = (content: string) => {
   try {
-    const text = content.trim();
+    const text = content
+      .replace(/<minimax:[^>]+>/g, "")
+      .replace(/<\/minimax:[^>]+>/g, "")
+      .replace(/<tool>/g, "")
+      .replace(/<\/tool>/g, "")
+      .trim();
     if (text.startsWith("{") || text.startsWith("[")) {
       return parsePartialJson(text, Allow.ALL) as unknown;
     }
@@ -256,9 +277,25 @@ const cleanThinkTags = (text: string) => {
   return cleaned.trim();
 };
 
-const createModel = () => {
+const deductBalance = async (userId: string) => {
+  try {
+    const supabase = await createClient();
+    await supabase.rpc("decrement_ai_balance", { p_user_id: userId });
+  } catch (err) {
+    console.error("[balance] deductBalance failed", err);
+  }
+};
+
+const resolveModel = (requested?: string): string => {
+  if (requested && (ALLOWED_MODELS as readonly string[]).includes(requested)) {
+    return requested;
+  }
+  return DEFAULT_MODEL;
+};
+
+const createModel = (modelName?: string) => {
   return new ChatOpenAI({
-    model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    model: resolveModel(modelName),
     temperature: 0.2,
     apiKey: process.env.OPENAI_API_KEY,
     configuration: process.env.OPENAI_BASE_URL
@@ -310,6 +347,7 @@ type PersistContext = {
   sessionId: string | null;
   userMessage: string | null;
   workflowSteps: WorkflowStep[];
+  userId: string | null;
 };
 
 const touchSessionActivity = async (
@@ -587,23 +625,31 @@ const buildVerificationSummary = (workflowSteps: WorkflowStep[]) => {
 const buildEngineerExecutionBrief = ({
   summary,
   finalized,
+  interrupted,
+  interruptionDetail,
   baselineFiles,
   nextFiles,
   workflowSteps,
 }: {
   summary?: string;
   finalized: boolean;
+  interrupted?: boolean;
+  interruptionDetail?: string;
   baselineFiles: ProjectFile[];
   nextFiles: ProjectFile[];
   workflowSteps: WorkflowStep[];
 }) => {
   const cleanedSummary = typeof summary === "string" ? summary.trim().replace(/\s+/g, " ") : "";
   const changedPaths = collectChangedProjectPaths(baselineFiles, nextFiles);
-  const completionLine = isUserFacingExecutionSummary(cleanedSummary)
-    ? cleanedSummary
-    : finalized
-      ? "已完成本轮需求对应的代码实现，并同步了项目文件。"
-      : "已完成本轮主要代码改动，虽然工具未返回标准 final，但改动结果已经保留。";
+  const completionLine = interrupted
+    ? interruptionDetail
+      ? `本轮生成被中断，当前仅保留已成功落地的部分改动。原因：${interruptionDetail}`
+      : "本轮生成被中断，当前仅保留已成功落地的部分改动。"
+    : isUserFacingExecutionSummary(cleanedSummary)
+      ? cleanedSummary
+      : finalized
+        ? "已完成本轮需求对应的代码实现，并同步了项目文件。"
+        : "已完成本轮主要代码改动，虽然工具未返回标准 final，但改动结果已经保留。";
 
   return [
     "本轮开发已完成，以下是小结：",
@@ -838,6 +884,11 @@ const hasMeaningfulFileChange = (baseline: ProjectFile[], candidate: ProjectFile
   return candidate.some((file) => baselineMap.get(file.path) !== file.code) || baseline.some((file) => !candidateMap.has(file.path));
 };
 
+const hasMeaningfulImplementationChange = (baseline: ProjectFile[], candidate: ProjectFile[]) => {
+  const filterTodo = (files: ProjectFile[]) => files.filter((file) => file.path !== "/todo.md");
+  return hasMeaningfulFileChange(filterTodo(baseline), filterTodo(candidate));
+};
+
 const persistChangedProjectFiles = async ({
   supabase,
   projectId,
@@ -1020,7 +1071,13 @@ const parseToolLoopDecision = (content: string): ToolLoopDecision => {
 
 const tryParsePartialToolLoopDecision = (content: string) => {
   try {
-    const parsed = parsePartialJson(content, Allow.OBJ | Allow.ARR | Allow.STR) as unknown;
+    const normalized = content
+      .replace(/<minimax:[^>]+>/g, "")
+      .replace(/<\/minimax:[^>]+>/g, "")
+      .replace(/<tool>/g, "")
+      .replace(/<\/tool>/g, "")
+      .trim();
+    const parsed = parsePartialJson(normalized, Allow.OBJ | Allow.ARR | Allow.STR) as unknown;
     if (!parsed || typeof parsed !== "object") return null;
     const record = parsed as Record<string, unknown>;
 
@@ -1108,6 +1165,26 @@ type FileToolLoopParams = {
   maxRounds?: number;
 };
 
+const buildToolLoopStreamingDetail = ({
+  partial,
+  elapsedMs,
+}: {
+  partial: ReturnType<typeof tryParsePartialToolLoopDecision>;
+  elapsedMs: number;
+}) => {
+  if (partial?.action === "tool_call") {
+    const toolLabel = partial.tool ?? "unknown";
+    const pathLabel = partial.path ? ` · ${partial.path}` : "";
+    return `模型正在生成工具调用: ${toolLabel}${pathLabel}`;
+  }
+
+  if (partial?.action === "final") {
+    return "模型正在整理 final 结果";
+  }
+
+  return `模型正在生成工具决策（${Math.ceil(elapsedMs / 1000)}s）`;
+};
+
 const runFileToolLoop = async ({
   llm,
   controller,
@@ -1140,6 +1217,9 @@ const runFileToolLoop = async ({
   let projectFilesResult: ProjectFile[] = [];
   let summary: string | undefined;
   let finalized = false;
+  let interrupted = false;
+  let interruptionDetail: string | undefined;
+  let consecutiveNoChangeFinals = 0;
 
   await writeDebugLog({
     sessionId: persistCtx.sessionId,
@@ -1174,20 +1254,60 @@ const runFileToolLoop = async ({
       detail: `工具闭环第 ${round} 轮`,
     });
 
-    const loopText = await invokeWithStream(
-      llm,
-      toolLoopMessages,
-      agentType,
-      agentName,
-      controller,
-      encoder,
-      persistCtx,
-      agentMessageIds,
-      {
+    let loopText: string;
+    try {
+      loopText = await invokeWithStream(
+        llm,
+        toolLoopMessages,
+        agentType,
+        agentName,
+        controller,
+        encoder,
+        persistCtx,
+        agentMessageIds,
+        {
+          callId: rootToolCallId,
+          toolName: rootToolName,
+        }
+      );
+    } catch (error) {
+      interrupted = true;
+      interruptionDetail = error instanceof Error ? error.message : "工具闭环流式输出失败";
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "llm-output-stream-error",
+        round,
+        detail: interruptionDetail,
+      });
+
+      sendTrackedEvent({
+        eventType: "tool",
         callId: rootToolCallId,
+        action: "tool_error",
         toolName: rootToolName,
+        detail: interruptionDetail,
+      });
+
+      if (round < maxRounds) {
+        sendTrackedEvent({
+          eventType: "tool",
+          callId: rootToolCallId,
+          action: "tool_input_delta",
+          toolName: rootToolName,
+          detail: `上一轮未完成，正在进入第 ${round + 1} 轮重试`,
+        });
+
+        toolLoopMessages.push(
+          new HumanMessage(
+            `上一轮没有完成有效工具决策，原因：${interruptionDetail}。请不要输出解释或大段总结，直接返回一个更小、更快完成的 JSON 工具调用；优先分步读取/写入文件，不要一次输出整套大文件和长篇说明。`
+          )
+        );
+        continue;
       }
-    );
+
+      break;
+    }
 
     let decision: ToolLoopDecision;
     try {
@@ -1221,6 +1341,16 @@ const runFileToolLoop = async ({
         toolName: rootToolName,
         detail: error instanceof Error ? error.message : "工具闭环解析失败",
       });
+
+      if (round < maxRounds) {
+        toolLoopMessages.push(
+          new HumanMessage(
+            `上一轮输出无法解析为合法 JSON，原因：${error instanceof Error ? error.message : "解析失败"}。请重新输出一个严格 JSON 对象——要么是工具调用，要么是最终 final，不要添加任何说明或 Markdown 包装。`
+          )
+        );
+        continue;
+      }
+
       break;
     }
 
@@ -1248,19 +1378,23 @@ const runFileToolLoop = async ({
           },
         });
 
+        consecutiveNoChangeFinals += 1;
+
         sendTrackedEvent({
           eventType: "tool",
           callId: rootToolCallId,
           action: "tool_input_delta",
           toolName: rootToolName,
-          detail: "检测到 final 未包含有效代码改动，继续迭代",
+          detail: `检测到 final 未包含有效代码改动，继续迭代（第 ${consecutiveNoChangeFinals} 次）`,
         });
 
-        toolLoopMessages.push(
-          new HumanMessage(
-            "校验失败：你提交的 final 与输入文件相比没有任何有效改动。请继续调用 wc.fs.readFile / wc.fs.writeFile / wc.fs.rm，并在 final 中仅输出真实变更文件或 deletedPaths。"
-          )
-        );
+        const noChangeEscalation = consecutiveNoChangeFinals >= 3
+          ? `【强制要求】你已连续 ${consecutiveNoChangeFinals} 次提交了没有任何文件改动的 final，这是不允许的。你必须立刻调用 wc.fs.writeFile 写入至少一个目标文件，然后才能提交 final。不要再输出空 final 或解释。`
+          : consecutiveNoChangeFinals >= 2
+            ? `校验失败（第 ${consecutiveNoChangeFinals} 次）：你不能再次提交无改动的 final。你必须先调用 wc.fs.readFile 读取目标文件，再调用 wc.fs.writeFile 写入修改后的内容，然后才能提交包含真实改动的 final。`
+            : "校验失败：你提交的 final 与输入文件相比没有任何有效改动。请继续调用 wc.fs.readFile / wc.fs.writeFile / wc.fs.rm，并在 final 中仅输出真实变更文件或 deletedPaths。";
+
+        toolLoopMessages.push(new HumanMessage(noChangeEscalation));
         continue;
       }
 
@@ -1292,6 +1426,7 @@ const runFileToolLoop = async ({
         continue;
       }
 
+      consecutiveNoChangeFinals = 0;
       finalized = true;
       projectFilesResult = candidateFiles;
       summary = decision.summary;
@@ -1486,6 +1621,8 @@ const runFileToolLoop = async ({
     projectFiles: projectFilesResult,
     summary,
     finalized,
+    interrupted,
+    interruptionDetail,
   };
 };
 
@@ -1500,10 +1637,13 @@ const invokeWithStream = async (
   agentMessageIds: Map<string, string>,
   toolContext?: { callId: string; toolName: ToolEvent["toolName"] }
 ) => {
+  if (persistCtx.userId) {
+    await deductBalance(persistCtx.userId);
+  }
   const stream = await llm.stream(normalizeMessagesForProvider(messages));
   let fullContent = "";
-  let lastDeltaLength = 0;
-  let lastPreview = "";
+  let lastPreviewAt = 0;
+  const startedAt = Date.now();
   const sendTrackedEvent = (payload: StreamEvent) => {
     recordWorkflowEvent(persistCtx, payload);
     sendEvent(controller, encoder, payload);
@@ -1513,33 +1653,28 @@ const invokeWithStream = async (
     if (!textChunk) continue;
     fullContent += textChunk;
 
-    if (toolContext && fullContent.length - lastDeltaLength >= 220) {
-      lastDeltaLength = fullContent.length;
+    if (toolContext) {
+      const elapsedMs = Date.now() - startedAt;
 
-      let detail = `处理中... ${fullContent.length} 字符`;
-      const partial = tryParsePartialToolLoopDecision(fullContent);
-      if (partial?.action === "tool_call") {
-        const toolLabel = partial.tool ?? "unknown";
-        const pathLabel = partial.path ? ` (${partial.path})` : "";
-        detail = `候选调用: ${toolLabel}${pathLabel}`;
+      if (elapsedMs > TOOL_LOOP_ROUND_MAX_DURATION_MS) {
+        throw new Error(`单轮工具决策生成超时（>${Math.ceil(TOOL_LOOP_ROUND_MAX_DURATION_MS / 1000)}s），已中止本轮并回退。`);
       }
+    }
 
-      if (partial?.action === "final") {
-        detail = "候选状态: final";
+    if (toolContext) {
+      const now = Date.now();
+      if (now - lastPreviewAt >= 1000) {
+        lastPreviewAt = now;
+        const partial = tryParsePartialToolLoopDecision(fullContent);
+        const detail = buildToolLoopStreamingDetail({ partial, elapsedMs: now - startedAt });
+        sendTrackedEvent({
+          eventType: "tool",
+          callId: toolContext.callId,
+          action: "tool_input_delta",
+          toolName: toolContext.toolName,
+          detail,
+        });
       }
-
-      if (detail === lastPreview) {
-        detail = `处理中... ${fullContent.length} 字符`;
-      }
-      lastPreview = detail;
-
-      sendTrackedEvent({
-        eventType: "tool",
-        callId: toolContext.callId,
-        action: "tool_input_delta",
-        toolName: toolContext.toolName,
-        detail,
-      });
     }
     
     if (!toolContext) {
@@ -1565,11 +1700,21 @@ export async function POST(req: Request) {
       projectId,
       sessionId,
       isNewProject,
+      attachments,
+      model: requestedModel,
     } = (await req.json()) as RequestBody;
 
     const legacyProjectFiles = normalizeProjectFiles(requestProjectFiles);
     const hotFiles = normalizeProjectFiles(requestHotFiles);
     const fileTree = normalizeFileTree(requestFileTree);
+
+    const attachmentsContext = attachments && attachments.length > 0
+      ? `用户上传的参考附件:\n${attachments.map((a) =>
+          a.mimeType.startsWith("image/")
+            ? `--- 图片附件: ${a.name} (${a.mimeType}) ---\n[图片内容, base64 Data URL 略去，共 ${a.content.length} 字节]`
+            : `--- 文件名: ${a.name} ---\n${a.content}`
+        ).join("\n\n")}`
+      : "";
 
     if (!message && !errorMessage) {
       return NextResponse.json({ error: "Missing message" }, { status: 400 });
@@ -1580,6 +1725,39 @@ export async function POST(req: Request) {
       async start(controller) {
         try {
           const supabase = await createClient();
+
+          // 鉴权与额度检查
+          const { data: { user: authUser } } = await supabase.auth.getUser();
+          if (!authUser) {
+            sendEvent(controller, encoder, {
+              agent: "engineer",
+              name: "Alex",
+              status: "error",
+              content: "请先登录再使用 AI 功能。",
+            });
+            controller.close();
+            return;
+          }
+
+          const { data: profileData } = await supabase
+            .from("profiles")
+            .select("ai_balance")
+            .eq("id", authUser.id)
+            .maybeSingle();
+
+          if (profileData && profileData.ai_balance <= 0) {
+            sendEvent(controller, encoder, {
+              agent: "engineer",
+              name: "Alex",
+              status: "error",
+              content: "您的 AI 额度已用尽，无法继续使用。请联系管理员充值。",
+            });
+            controller.close();
+            return;
+          }
+
+          const activeUserId = authUser.id;
+
           const persistedProjectFiles = await loadProjectFilesFromStorage(supabase, projectId);
           const baseProjectFiles = persistedProjectFiles.length ? persistedProjectFiles : legacyProjectFiles;
           const effectiveHotFiles = hotFiles.length ? hotFiles : legacyProjectFiles;
@@ -1639,6 +1817,7 @@ export async function POST(req: Request) {
             sessionId: activeSessionId,
             userMessage: typeof message === "string" ? message : null,
             workflowSteps: [],
+            userId: activeUserId,
           };
           const sendTrackedEvent = (payload: StreamEvent) => {
             recordWorkflowEvent(persistCtx, payload);
@@ -1658,7 +1837,7 @@ export async function POST(req: Request) {
             }
           }
 
-          const llm = createModel();
+          const llm = createModel(requestedModel);
 
           let routeDecision: EngineerRouteDecision;
 
@@ -1676,9 +1855,9 @@ export async function POST(req: Request) {
             sendTrackedEvent({
               eventType: "step",
               stepId: "route",
-              title: "任务判断",
+              title: "任务处理",
               status: "running",
-              detail: "工程师正在判断这是聊天还是开发任务",
+              detail: "正在思考这轮消息该如何处理",
             });
 
             sendTrackedEvent({
@@ -1686,14 +1865,14 @@ export async function POST(req: Request) {
               callId: routeToolCallId,
               action: "tool_start",
               toolName: "route_request",
-              detail: "分析用户输入并决定是否进入开发闭环",
+              detail: "分析用户输入并整理后续处理方式",
             });
 
             await emitEvent(controller, encoder, {
               agent: "engineer",
               name: "Alex",
               status: "thinking",
-              content: "我先判断这轮是普通聊天，还是要继续进入开发。",
+              content: "我先思考一下这轮要怎么处理。",
             }, persistCtx, agentMessageIds);
 
             const hasExistingFiles = projectFiles.length > 0;
@@ -1706,7 +1885,12 @@ export async function POST(req: Request) {
                 : "当前项目暂无文件。",
               `当前项目文件树:\n${fileTreeSummary}`,
               `预置关键文件全文:\n${bootstrapFilesContext}`,
-            ].join("\n\n");
+              attachmentsContext || "",
+            ].filter(Boolean).join("\n\n");
+
+            if (persistCtx.userId) {
+              await deductBalance(persistCtx.userId);
+            }
 
             const routeResponse = await llm.invoke(
               normalizeMessagesForProvider([
@@ -1737,7 +1921,7 @@ export async function POST(req: Request) {
                 callId: routeToolCallId,
                 action: "tool_error",
                 toolName: "route_request",
-                detail: error instanceof Error ? error.message : "任务判断解析失败",
+                detail: error instanceof Error ? error.message : "任务处理结果解析失败",
               });
               throw error;
             }
@@ -1747,16 +1931,40 @@ export async function POST(req: Request) {
               callId: routeToolCallId,
               action: "tool_result",
               toolName: "route_request",
-              detail: `已识别模式: ${routeDecision.mode}`,
+              detail: `后续处理方式: ${routeDecision.mode}`,
             });
 
             sendTrackedEvent({
               eventType: "step",
               stepId: "route",
-              title: "任务判断",
+              title: "任务处理",
               status: "done",
               detail: `${routeDecision.mode} · ${routeDecision.intentSummary}`,
             });
+          }
+
+          // 如果是新项目且路由节点生成了有效的语义化项目名，则重命名项目
+          if (
+            isNewProject &&
+            projectId &&
+            routeDecision.mode !== "chat" &&
+            routeDecision.projectName &&
+            routeDecision.projectName.length >= 2 &&
+            routeDecision.projectName.length <= 16
+          ) {
+            try {
+              await supabase
+                .from("projects")
+                .update({ name: routeDecision.projectName })
+                .eq("id", projectId)
+                .eq("user_id", activeUserId);
+              sendTrackedEvent({
+                eventType: "project_rename",
+                name: routeDecision.projectName,
+              });
+            } catch (err) {
+              console.error("[project_rename] failed to rename project", err);
+            }
           }
 
           if (routeDecision.mode === "chat") {
@@ -1825,6 +2033,7 @@ export async function POST(req: Request) {
             `当前项目文件树:\n${fileTreeSummary}`,
             `预置关键文件全文:\n${bootstrapFilesContext}`,
             `热文件全文:\n${hotFilesContext}`,
+            attachmentsContext || "",
             "要求：先创建或更新根目录 /todo.md，再进行代码修改；任务完成后用中文输出面向用户的完成报告；final 中只输出真实变更文件和 deletedPaths。",
           ]
             .filter(Boolean)
@@ -1843,10 +2052,11 @@ export async function POST(req: Request) {
             initialFiles: projectFiles,
             taskInput: executionTaskInput,
             requireTodoUpdate: routeDecision.shouldWriteTodo,
-            maxRounds: 5,
+            maxRounds: 8,
           });
 
           const hasFileChanges = hasMeaningfulFileChange(projectFiles, executionResult.projectFiles);
+          const hasImplementationChanges = hasMeaningfulImplementationChange(projectFiles, executionResult.projectFiles);
           let fileTimestamps: Array<{ path: string; updated_at: string }> = [];
 
           if (hasFileChanges) {
@@ -1880,8 +2090,14 @@ export async function POST(req: Request) {
             eventType: "step",
             stepId: "execute",
             title: "工程执行",
-            status: hasFileChanges ? "done" : "error",
-            detail: hasFileChanges ? "本轮任务已完成" : "未检测到有效文件改动",
+            status: hasImplementationChanges && !executionResult.interrupted ? "done" : "error",
+            detail: hasImplementationChanges
+              ? executionResult.interrupted
+                ? "已保留部分代码改动，但本轮未完整完成"
+                : "本轮任务已完成"
+              : hasFileChanges
+                ? "仅同步了任务清单，代码实现尚未完成"
+                : "未检测到有效文件改动",
           });
 
           sendTrackedEvent({
@@ -1889,20 +2105,28 @@ export async function POST(req: Request) {
             callId: executeToolCallId,
             action: "tool_result",
             toolName: "execute_task",
-            detail: hasFileChanges
-              ? `执行完成，当前项目文件数: ${executionResult.projectFiles.length}`
-              : "执行完成，但未检测到有效文件改动",
+            detail: hasImplementationChanges
+              ? executionResult.interrupted
+                ? `执行被中断，已保留部分代码改动，当前项目文件数: ${executionResult.projectFiles.length}`
+                : `执行完成，当前项目文件数: ${executionResult.projectFiles.length}`
+              : hasFileChanges
+                ? "仅写入了任务清单，尚未完成实际代码实现"
+                : "执行完成，但未检测到有效文件改动",
           });
 
-          const finalEngineerContent = hasFileChanges
+          const finalEngineerContent = hasImplementationChanges
             ? buildEngineerExecutionBrief({
                 summary: executionResult.summary,
                 finalized: executionResult.finalized,
+                interrupted: executionResult.interrupted,
+                interruptionDetail: executionResult.interruptionDetail,
                 baselineFiles: projectFiles,
                 nextFiles: executionResult.projectFiles,
                 workflowSteps: persistCtx.workflowSteps,
               })
-            : "本轮没有形成有效文件改动，请补充更具体的需求。";
+            : hasFileChanges
+              ? "本轮只更新了 /todo.md，实际代码实现还没完成。请继续执行下一轮开发，而不要把任务清单写入当成完成结果。"
+              : "本轮没有形成有效文件改动，请补充更具体的需求。";
 
           await emitEvent(controller, encoder, {
             agent: "engineer",

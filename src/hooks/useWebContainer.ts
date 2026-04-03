@@ -52,6 +52,7 @@ export function useWebContainer() {
   const startedRef = useRef(false);
   const startingRef = useRef<Promise<void> | null>(null);
   const syncedFilesRef = useRef<FilesMap>({});
+  const pendingStartupWritesRef = useRef<Map<string, string>>(new Map());
   const logBufferRef = useRef("");
   const processCounterRef = useRef(0);
   const processesRef = useRef<Map<string, ManagedProcess>>(new Map());
@@ -180,6 +181,20 @@ export function useWebContainer() {
           throw new Error(`npm install failed with exit code ${installExit}`);
         }
 
+        // 将 npm install 期间通过 bridge 写入的文件同步到容器 fs
+        if (pendingStartupWritesRef.current.size > 0) {
+          appendLog(`[runtime] Applying ${pendingStartupWritesRef.current.size} pending file write(s)...`);
+          for (const [logicalPath, content] of pendingStartupWritesRef.current.entries()) {
+            const runtimePath = toRuntimePath(logicalPath);
+            const dirPath = toDirectoryPath(runtimePath);
+            if (dirPath) {
+              await wc.fs.mkdir(dirPath, { recursive: true });
+            }
+            await wc.fs.writeFile(runtimePath, content);
+          }
+          pendingStartupWritesRef.current.clear();
+        }
+
         appendLog("[runtime] Starting dev server...");
         const devProc = await wc.spawn("npm", ["run", "dev"]);
         registerProcess(devProc, "[runtime] npm run dev started");
@@ -264,20 +279,34 @@ export function useWebContainer() {
 
   const writeFile = useCallback(
     async (logicalPath: string, content: string) => {
-      const wc = await ensureStarted();
+      // 始终更新内存 VFS，确保 syncedFilesRef 是最新状态
+      syncedFilesRef.current = {
+        ...syncedFilesRef.current,
+        [logicalPath]: content,
+      };
 
+      if (!wcRef.current || !isReady) {
+        // 容器尚未初始化，文件已缓存在 syncedFilesRef，mount 时会包含
+        return;
+      }
+
+      if (!startedRef.current) {
+        // 容器正在启动（npm install 进行中），将文件加入待写队列
+        // ensureStarted 完成后会在启动 dev server 前统一写入
+        pendingStartupWritesRef.current.set(logicalPath, content);
+        return;
+      }
+
+      // 容器已就绪，直接写入
+      const wc = wcRef.current;
       const runtimePath = toRuntimePath(logicalPath);
       const dirPath = toDirectoryPath(runtimePath);
       if (dirPath) {
         await wc.fs.mkdir(dirPath, { recursive: true });
       }
       await wc.fs.writeFile(runtimePath, content);
-      syncedFilesRef.current = {
-        ...syncedFilesRef.current,
-        [logicalPath]: content,
-      };
     },
-    [ensureStarted]
+    [isReady]
   );
 
   const readFile = useCallback(

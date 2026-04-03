@@ -5,12 +5,12 @@ import { createClient } from "@/lib/supabase/server";
 const fileSchema = z.object({
   path: z.string().trim().min(1).max(500),
   content: z.string(),
-  expectedUpdatedAt: z.string().datetime().nullable().optional(),
+  expectedUpdatedAt: z.string().datetime({ offset: true }).nullable().optional(),
 });
 
 const deletedFileSchema = z.object({
   path: z.string().trim().min(1).max(500),
-  expectedUpdatedAt: z.string().datetime().nullable().optional(),
+  expectedUpdatedAt: z.string().datetime({ offset: true }).nullable().optional(),
 });
 
 const syncFilesSchema = z

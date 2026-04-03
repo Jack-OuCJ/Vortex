@@ -13,7 +13,7 @@ const createProjectTitleSchema = z.object({
 
 const createModel = () => {
   return new ChatOpenAI({
-    model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    model: "MiniMax-M2.7",
     temperature: 0.4,
     apiKey: process.env.OPENAI_API_KEY,
     configuration: process.env.OPENAI_BASE_URL

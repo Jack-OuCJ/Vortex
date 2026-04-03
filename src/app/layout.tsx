@@ -20,6 +20,9 @@ const ibmPlexSerif = IBM_Plex_Serif({
 export const metadata: Metadata = {
   title: "Vortex：用AI构建网站和应用",
   description: "Vortex 智能构建生成工具",
+  icons: {
+    icon: "/favicon.svg",
+  },
 };
 
 export default function RootLayout({

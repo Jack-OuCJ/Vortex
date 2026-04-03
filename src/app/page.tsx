@@ -11,12 +11,14 @@ export default async function Home() {
     email: string | null;
     username: string | null;
     avatar_url: string | null;
+    ai_balance: number | null;
+    max_ai_balance: number | null;
   } | null = null;
 
   if (user) {
     const { data } = await supabase
       .from("profiles")
-      .select("email, username, avatar_url")
+      .select("email, username, avatar_url, ai_balance, max_ai_balance")
       .eq("id", user.id)
       .maybeSingle();
 

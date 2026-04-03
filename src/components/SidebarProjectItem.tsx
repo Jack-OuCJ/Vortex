@@ -11,19 +11,42 @@ export function SidebarProjectItem({ project }: { project: ProjectMeta }) {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [editName, setEditName] = useState(project.name);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuDivRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const { updateProjectName, deleteProject } = useHistoryStore();
 
+  // 点击外部关闭菜单
   useEffect(() => {
+    if (!showMenu) return;
+
     const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (!menuDivRef.current?.contains(target) && !triggerRef.current?.contains(target)) {
         setShowMenu(false);
       }
     };
-    if (showMenu) document.addEventListener("mousedown", handleClickOutside);
+
+    document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showMenu]);
+
+  const handleToggleMenu = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (showMenu) {
+      setShowMenu(false);
+      return;
+    }
+    if (triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      setMenuPosition({
+        top: rect.top,
+        left: rect.right + 8,
+      });
+    }
+    setShowMenu(true);
+  };
 
   const handleRename = async () => {
     if (editName.trim() && editName !== project.name) {
@@ -77,49 +100,53 @@ export function SidebarProjectItem({ project }: { project: ProjectMeta }) {
       </button>
 
       {!isEditing && (
-        <div className="relative" ref={menuRef}>
+        <div className="relative">
           <button
-            onClick={(e) => {
-              e.stopPropagation();
-              setShowMenu(!showMenu);
-            }}
+            ref={triggerRef}
+            onClick={handleToggleMenu}
             className="opacity-0 group-hover:opacity-100 p-1 hover:bg-foreground/10 rounded transition-opacity"
           >
             <MoreHorizontal className="size-4" />
           </button>
-
-          <AnimatePresence>
-            {showMenu && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                transition={{ duration: 0.1 }}
-                className="absolute left-0 top-full mt-1 w-32 bg-popover border border-border rounded-md shadow-md z-[60] overflow-hidden"
-              >
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setIsEditing(true);
-                    setShowMenu(false);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-muted transition-colors text-left"
-                >
-                  <Pencil className="size-3.5" /> 重命名
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDelete();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors text-left"
-                >
-                  <Trash2 className="size-3.5 text-red-500" /> 删除
-                </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
+      )}
+
+      {/* 菜单 portal：脱离侧边栏滚动容器，避免被裁切 */}
+      {typeof window !== "undefined" && createPortal(
+        <AnimatePresence>
+          {showMenu && menuPosition && (
+            <motion.div
+              ref={menuDivRef}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={{ duration: 0.1 }}
+              className="fixed w-36 bg-white dark:bg-zinc-900 border border-black/8 dark:border-white/10 rounded-xl shadow-lg z-[80] overflow-hidden py-1"
+              style={{ top: menuPosition.top, left: menuPosition.left }}
+            >
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsEditing(true);
+                  setShowMenu(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-muted transition-colors text-left"
+              >
+                <Pencil className="size-3.5" /> 重命名
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDelete();
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors text-left"
+              >
+                <Trash2 className="size-3.5 text-red-500" /> 删除
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>,
+        document.body
       )}
 
       {/* Delete Confirmation Modal */}
