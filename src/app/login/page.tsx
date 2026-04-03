@@ -103,6 +103,9 @@ export default function LoginPage() {
       provider: "google",
       options: {
         redirectTo,
+        queryParams: {
+          prompt: "select_account",
+        },
       },
     });
 
