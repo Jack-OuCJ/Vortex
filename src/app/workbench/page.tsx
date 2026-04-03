@@ -521,15 +521,52 @@ export function WorkbenchContent() {
     return `${date.getMonth() + 1}月 ${date.getDate()}, ${date.getFullYear()}`;
   };
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const SCROLL_BOTTOM_THRESHOLD_PX = 96;
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const isNearBottom = (element: HTMLDivElement, threshold = SCROLL_BOTTOM_THRESHOLD_PX) => {
+    return element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
   };
 
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const container = messagesContainerRef.current;
+
+    if (container) {
+      shouldStickToBottomRef.current = true;
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior,
+      });
+      return;
+    }
+
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, []);
+
+  const handleMessagesScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+
+    if (!container) {
+      return;
+    }
+
+    shouldStickToBottomRef.current = isNearBottom(container);
+  }, []);
+
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (!shouldStickToBottomRef.current) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom(messages.length <= 1 ? "auto" : "smooth");
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, steps, scrollToBottom]);
 
   useEffect(() => {
     let mounted = true;
@@ -1332,7 +1369,7 @@ export function WorkbenchContent() {
         )}
 
         {/* Chat Flow Container */}
-        <div className="flex-1 overflow-y-auto px-6 space-y-4 scrollbar-thin scrollbar-thumb-muted-foreground/30">
+        <div ref={messagesContainerRef} onScroll={handleMessagesScroll} className="flex-1 overflow-y-auto px-6 space-y-4 scrollbar-thin scrollbar-thumb-muted-foreground/30">
           {messages.map((msg, idx) => {
             const isFirstInDay = checkNeedDivider(msg.timestamp, idx > 0 ? messages[idx - 1].timestamp : undefined);
             const isToday = nowTs ? !checkNeedDivider(msg.timestamp, nowTs) : false;

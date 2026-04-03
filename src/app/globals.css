@@ -40,3 +40,21 @@ body {
   color: var(--foreground);
   font-family: var(--font-sans);
 }
+
+button:not(:disabled),
+a[href],
+summary,
+label[for],
+select:not(:disabled),
+input[type="button"]:not(:disabled),
+input[type="submit"]:not(:disabled),
+input[type="reset"]:not(:disabled),
+[role="button"] {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
