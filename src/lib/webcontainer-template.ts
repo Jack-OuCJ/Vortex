@@ -28,6 +28,14 @@ const GENERATED_RUNTIME_FILES = new Set([
   "tsconfig.tsbuildinfo",
 ]);
 
+const normalizeLogicalPath = (logicalPath: string): string => {
+  if (!logicalPath.trim()) {
+    return "/";
+  }
+
+  return logicalPath.startsWith("/") ? logicalPath : `/${logicalPath}`;
+};
+
 const PREVIEW_SCROLL_GUARD_MARKER = "data-vortex-preview-scroll-guard";
 
 const PREVIEW_SCROLL_GUARD_SCRIPT = [
@@ -220,7 +228,7 @@ export const WEBCONTAINER_TEMPLATE: FileSystemTree = {
 // 路径工具
 // ---------------------------------------------------------------------------
 
-/** 将逻辑路径（可能带 / 前缀或不带 src/ 前缀）标准化为运行时文件树路径 */
+/** 将逻辑路径（可能带 / 前缀或不带 src/ 前缀）标准化为运行时文件树路径。 */
 export const toRuntimePath = (logicalPath: string): string => {
   const normalized = logicalPath.startsWith("/") ? logicalPath.slice(1) : logicalPath;
   if (ROOT_LEVEL_RUNTIME_FILES.has(normalized)) {
@@ -232,9 +240,40 @@ export const toRuntimePath = (logicalPath: string): string => {
   return `src/${normalized}`;
 };
 
-/** 将运行时路径映射回逻辑路径（src 下文件会去掉 src/ 前缀）。 */
+/** 将逻辑路径收敛为规范格式：业务代码固定使用 /src/...，仅少数运行时配置文件保留根目录。 */
+export const canonicalizeLogicalPath = (logicalPath: string): string => {
+  const normalized = normalizeLogicalPath(logicalPath);
+  const withoutLeadingSlash = normalized.slice(1);
+
+  if (!withoutLeadingSlash) {
+    return "/";
+  }
+
+  if (ROOT_LEVEL_RUNTIME_FILES.has(withoutLeadingSlash)) {
+    return normalized;
+  }
+
+  if (withoutLeadingSlash.startsWith("src/")) {
+    return normalized;
+  }
+
+  return `/${toRuntimePath(withoutLeadingSlash)}`;
+};
+
+/** 返回旧版逻辑路径别名，用于迁移历史上扁平化到根目录的业务文件。 */
+export const getLegacyLogicalAliases = (logicalPath: string): string[] => {
+  const canonicalPath = canonicalizeLogicalPath(logicalPath);
+
+  if (!canonicalPath.startsWith("/src/")) {
+    return [];
+  }
+
+  return [`/${canonicalPath.slice(5)}`];
+};
+
+/** 将运行时路径映射回逻辑路径，保留真实目录层级。 */
 export const toLogicalPath = (runtimePath: string): string => {
-  return runtimePath.startsWith("src/") ? `/${runtimePath.slice(4)}` : `/${runtimePath}`;
+  return canonicalizeLogicalPath(`/${runtimePath}`);
 };
 
 /** 判断运行时文件是否应该持久化到数据库。 */
@@ -267,7 +306,8 @@ export const toDirectoryPath = (runtimePath: string): string => {
 
 /**
  * 将 Agent 产出的 {逻辑路径 → 代码} 映射合并到模板文件树中。
- * - src 下文件使用 /App.tsx 这类逻辑路径
+ * - src 下文件使用 /src/App.tsx 这类规范逻辑路径
+ * - 兼容历史路径：/App.tsx 会自动映射到 /src/App.tsx
  * - 根目录文件使用 /package.json 这类逻辑路径
  * - 若 Agent 没有产出 App.tsx，则保留模板默认占位
  */

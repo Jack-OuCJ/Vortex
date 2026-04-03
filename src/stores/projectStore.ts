@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { getPersistedTemplateFiles } from "@/lib/webcontainer-template";
+import { canonicalizeLogicalPath, getPersistedTemplateFiles } from "@/lib/webcontainer-template";
 
 type ProjectFiles = Record<string, string>;
 type FileTimestamps = Record<string, string | null>;
@@ -14,8 +14,22 @@ export type ConflictCandidate = {
 
 type ConflictCandidates = Record<string, ConflictCandidate>;
 
+const normalizeProjectFilesMap = (files: ProjectFiles): ProjectFiles => {
+  return Object.entries(files).reduce<ProjectFiles>((acc, [path, content]) => {
+    acc[canonicalizeLogicalPath(path)] = content;
+    return acc;
+  }, {});
+};
+
+const normalizeFileTimestamps = (rows: Array<{ path: string; updated_at: string | null }>): FileTimestamps => {
+  return rows.reduce<FileTimestamps>((acc, row) => {
+    acc[canonicalizeLogicalPath(row.path)] = row.updated_at;
+    return acc;
+  }, {});
+};
+
 const DEFAULT_FILES: ProjectFiles = getPersistedTemplateFiles();
-const DEFAULT_ACTIVE_FILE_PATH = "/App.tsx";
+const DEFAULT_ACTIVE_FILE_PATH = "/src/App.tsx";
 
 type ProjectStore = {
   projectId: string | null;
@@ -56,13 +70,15 @@ export const useProjectStore = create<ProjectStore>((set) => ({
   setIsBootstrapping: (isBootstrapping) => set({ isBootstrapping }),
   setFiles: (files) =>
     set((state) => {
-      const paths = Object.keys(files);
-      const fallbackPath = files[DEFAULT_ACTIVE_FILE_PATH]
+      const normalizedFiles = normalizeProjectFilesMap(files);
+      const paths = Object.keys(normalizedFiles);
+      const currentActivePath = canonicalizeLogicalPath(state.activeFilePath);
+      const fallbackPath = normalizedFiles[DEFAULT_ACTIVE_FILE_PATH]
         ? DEFAULT_ACTIVE_FILE_PATH
         : paths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
-      const nextActive = files[state.activeFilePath] ? state.activeFilePath : fallbackPath;
+      const nextActive = normalizedFiles[currentActivePath] ? currentActivePath : fallbackPath;
       return {
-        files,
+        files: normalizedFiles,
         activeFilePath: nextActive,
       };
     }),
@@ -78,16 +94,18 @@ export const useProjectStore = create<ProjectStore>((set) => ({
         });
       } else {
         rows.forEach((file) => {
-          nextFiles[file.path] = file.content;
-          nextTimestamps[file.path] = file.updated_at ?? null;
+          const normalizedPath = canonicalizeLogicalPath(file.path);
+          nextFiles[normalizedPath] = file.content;
+          nextTimestamps[normalizedPath] = file.updated_at ?? null;
         });
       }
 
       const paths = Object.keys(nextFiles);
+      const currentActivePath = canonicalizeLogicalPath(state.activeFilePath);
       const fallbackPath = nextFiles[DEFAULT_ACTIVE_FILE_PATH]
         ? DEFAULT_ACTIVE_FILE_PATH
         : paths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
-      const nextActive = nextFiles[state.activeFilePath] ? state.activeFilePath : fallbackPath;
+      const nextActive = nextFiles[currentActivePath] ? currentActivePath : fallbackPath;
 
       return {
         files: nextFiles,
@@ -100,7 +118,7 @@ export const useProjectStore = create<ProjectStore>((set) => ({
     set((state) => {
       const nextFiles = { ...state.files };
       for (const file of incoming) {
-        nextFiles[file.path] = file.code;
+        nextFiles[canonicalizeLogicalPath(file.path)] = file.code;
       }
       return { files: nextFiles };
     }),
@@ -115,12 +133,14 @@ export const useProjectStore = create<ProjectStore>((set) => ({
       const nextConflicts = { ...state.conflictCandidates };
 
       paths.forEach((path) => {
-        delete nextFiles[path];
-        delete nextTimestamps[path];
-        delete nextConflicts[path];
+        const normalizedPath = canonicalizeLogicalPath(path);
+        delete nextFiles[normalizedPath];
+        delete nextTimestamps[normalizedPath];
+        delete nextConflicts[normalizedPath];
       });
 
       const remainingPaths = Object.keys(nextFiles);
+      const currentActivePath = canonicalizeLogicalPath(state.activeFilePath);
       const fallbackPath = nextFiles[DEFAULT_ACTIVE_FILE_PATH]
         ? DEFAULT_ACTIVE_FILE_PATH
         : remainingPaths[0] ?? DEFAULT_ACTIVE_FILE_PATH;
@@ -129,7 +149,7 @@ export const useProjectStore = create<ProjectStore>((set) => ({
         files: nextFiles,
         fileTimestamps: nextTimestamps,
         conflictCandidates: nextConflicts,
-        activeFilePath: nextFiles[state.activeFilePath] ? state.activeFilePath : fallbackPath,
+        activeFilePath: nextFiles[currentActivePath] ? currentActivePath : fallbackPath,
       };
     }),
   setFileTimestamps: (rows) =>
@@ -138,10 +158,10 @@ export const useProjectStore = create<ProjectStore>((set) => ({
         return state;
       }
 
-      const nextTimestamps = { ...state.fileTimestamps };
-      rows.forEach((row) => {
-        nextTimestamps[row.path] = row.updated_at;
-      });
+      const nextTimestamps = {
+        ...state.fileTimestamps,
+        ...normalizeFileTimestamps(rows),
+      };
 
       return {
         fileTimestamps: nextTimestamps,
@@ -153,7 +173,11 @@ export const useProjectStore = create<ProjectStore>((set) => ({
 
       const next = { ...state.conflictCandidates };
       candidates.forEach((candidate) => {
-        next[candidate.path] = candidate;
+        const normalizedPath = canonicalizeLogicalPath(candidate.path);
+        next[normalizedPath] = {
+          ...candidate,
+          path: normalizedPath,
+        };
       });
 
       return {
@@ -162,19 +186,20 @@ export const useProjectStore = create<ProjectStore>((set) => ({
     }),
   clearConflictCandidate: (path) =>
     set((state) => {
-      if (!state.conflictCandidates[path]) return state;
+      const normalizedPath = canonicalizeLogicalPath(path);
+      if (!state.conflictCandidates[normalizedPath]) return state;
       const next = { ...state.conflictCandidates };
-      delete next[path];
+      delete next[normalizedPath];
       return { conflictCandidates: next };
     }),
   updateActiveFile: (path, code) =>
     set((state) => ({
       files: {
         ...state.files,
-        [path]: code,
+        [canonicalizeLogicalPath(path)]: code,
       },
     })),
-  setActiveFilePath: (path) => set({ activeFilePath: path }),
+  setActiveFilePath: (path) => set({ activeFilePath: canonicalizeLogicalPath(path) }),
 }));
 
 export const normalizeRemoteFiles = (
@@ -185,7 +210,7 @@ export const normalizeRemoteFiles = (
   }
 
   return files.reduce<ProjectFiles>((acc, file) => {
-    acc[file.path] = file.content;
+    acc[canonicalizeLogicalPath(file.path)] = file.content;
     return acc;
   }, {});
 };

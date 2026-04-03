@@ -18,6 +18,7 @@ import {
   type WebContainerToolInputMap,
   type WebContainerToolName,
 } from "@/lib/webcontainer-bridge";
+import { canonicalizeLogicalPath, getLegacyLogicalAliases } from "@/lib/webcontainer-template";
 import { formatWorkflowToolTitle, type WorkflowStep } from "@/lib/workflow";
 
 export const runtime = "nodejs";
@@ -522,7 +523,7 @@ const normalizeProjectFiles = (files: RequestProjectFile[] | undefined): Project
 
   return files
     .filter((file) => typeof file.path === "string" && typeof file.code === "string")
-    .map((file) => ({ path: file.path, code: file.code }));
+    .map((file) => ({ path: canonicalizeLogicalPath(file.path), code: file.code }));
 };
 
 const INTERNAL_SUMMARY_MARKERS = [
@@ -731,11 +732,11 @@ const mergeProjectFiles = (baseFiles: ProjectFile[], overlayFiles: ProjectFile[]
   const merged = new Map<string, string>();
 
   baseFiles.forEach((file) => {
-    merged.set(file.path, file.code);
+    merged.set(canonicalizeLogicalPath(file.path), file.code);
   });
 
   overlayFiles.forEach((file) => {
-    merged.set(file.path, file.code);
+    merged.set(canonicalizeLogicalPath(file.path), file.code);
   });
 
   return Array.from(merged.entries())
@@ -767,7 +768,7 @@ const loadProjectFilesFromStorage = async (
       (file): file is { path: string; content: string } =>
         typeof file.path === "string" && typeof file.content === "string"
     )
-    .map((file) => ({ path: file.path, code: file.content }));
+    .map((file) => ({ path: canonicalizeLogicalPath(file.path), code: file.content }));
 };
 
 const buildFileTreeSummary = (
@@ -827,9 +828,9 @@ const buildHotFilesContext = (files: ProjectFile[]) => {
 const BOOTSTRAP_FILE_PATHS = [
   "/package.json",
   "/index.html",
-  "/main.tsx",
-  "/index.css",
-  "/App.tsx",
+  "/src/main.tsx",
+  "/src/index.css",
+  "/src/App.tsx",
   "/todo.md",
 ];
 
@@ -922,6 +923,13 @@ const persistChangedProjectFiles = async ({
     .filter((file) => !nextPathSet.has(file.path))
     .map((file) => file.path);
 
+  const legacyPathsToDelete = Array.from(
+    new Set(
+      [...rowsToUpsert.map((row) => row.path), ...removedPaths]
+        .flatMap((filePath) => getLegacyLogicalAliases(filePath))
+    )
+  );
+
   if (rowsToUpsert.length) {
     const { error: upsertError } = await supabase
       .from("project_files")
@@ -932,19 +940,21 @@ const persistChangedProjectFiles = async ({
     }
   }
 
-  if (removedPaths.length) {
+  const allPathsToDelete = Array.from(new Set([...removedPaths, ...legacyPathsToDelete]));
+
+  if (allPathsToDelete.length) {
     const { error: deleteError } = await supabase
       .from("project_files")
       .delete()
       .eq("project_id", projectId)
-      .in("path", removedPaths);
+      .in("path", allPathsToDelete);
 
     if (deleteError) {
       throw new Error(`删除 project_files 失败: ${deleteError.message}`);
     }
   }
 
-  if (rowsToUpsert.length || removedPaths.length) {
+  if (rowsToUpsert.length || allPathsToDelete.length) {
     await touchProjectActivity(supabase, projectId);
   }
 
@@ -1420,7 +1430,7 @@ const runFileToolLoop = async ({
 
         toolLoopMessages.push(
           new HumanMessage(
-            "校验失败：这轮属于开发或修复任务，你必须先创建或更新根目录 /todo.md，并让内容真实反映本轮任务，再提交 final。"
+            "校验失败：这轮属于开发或修复任务，你必须先创建或更新根目录 /todo.md，并让内容真实反映本轮任务；所有业务代码文件必须写到 /src 下，再提交 final。"
           )
         );
         continue;
@@ -2034,7 +2044,7 @@ export async function POST(req: Request) {
             `预置关键文件全文:\n${bootstrapFilesContext}`,
             `热文件全文:\n${hotFilesContext}`,
             attachmentsContext || "",
-            "要求：先创建或更新根目录 /todo.md，再进行代码修改；任务完成后用中文输出面向用户的完成报告；final 中只输出真实变更文件和 deletedPaths。",
+            "要求：先创建或更新根目录 /todo.md，再进行代码修改；所有业务代码统一放在 /src 下；任务完成后用中文输出面向用户的完成报告；final 中只输出真实变更文件和 deletedPaths。",
           ]
             .filter(Boolean)
             .join("\n\n");
