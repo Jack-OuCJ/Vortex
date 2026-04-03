@@ -178,7 +178,7 @@ export function SidebarAndHeader({
       )}
 
       <header
-        className={`fixed top-0 left-0 right-0 h-16 flex items-center justify-between px-4 sm:px-6 transition-all duration-300 z-30 ${isPinned && resolvedUser ? "pl-72" : ""}`}
+        className={`fixed top-0 left-0 right-0 h-12 flex items-center justify-between px-4 sm:px-6 transition-all duration-300 z-30 ${isPinned && resolvedUser ? "pl-72" : ""}`}
       >
         <div className="flex items-center gap-4">
           {!resolvedUser || (!isPinned && !isHovered) ? (
@@ -208,13 +208,13 @@ export function SidebarAndHeader({
           <div className="flex items-center gap-2 text-sm z-50">
             <Link
               href="/login"
-              className="rounded-full border border-border bg-muted px-4 py-1.5 font-medium text-black/85 dark:text-white/85 transition-all duration-300 hover:scale-105 hover:bg-black/5 dark:hover:bg-white/5"
+              className="rounded-full border border-border bg-muted px-3 py-1 text-[14px] font-medium text-black/85 dark:text-white/85 transition-all duration-300 hover:scale-105 hover:bg-black/5 dark:hover:bg-white/5"
             >
               登录
             </Link>
             <Link
               href="/login"
-              className="rounded-full bg-primary px-4 py-1.5 font-medium text-primary-foreground transition-all duration-300 hover:scale-105 hover:bg-primary/90"
+              className="rounded-full bg-primary px-3 py-1 text-[14px] font-medium text-primary-foreground transition-all duration-300 hover:scale-105 hover:bg-primary/90"
             >
               注册
             </Link>

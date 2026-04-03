@@ -284,7 +284,7 @@ export default function HomeClient({
                 }
               }}
               onKeyDown={handleKeyDown}
-              placeholder="创建一个具有用户登录和数据库存储功能的SaaS订阅应用..."
+              placeholder="描述你想做的产品..."
               className="h-[80px] w-full resize-none rounded-xl border-0 bg-transparent p-2 text-[16px] text-foreground outline-none placeholder:text-foreground/40"
               disabled={isSubmitting}
             />
