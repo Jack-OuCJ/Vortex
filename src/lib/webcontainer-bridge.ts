@@ -85,7 +85,16 @@ type PendingBridgeRequest = {
   timer: ReturnType<typeof setTimeout>;
 };
 
-const pendingBridgeRequests = new Map<string, PendingBridgeRequest>();
+declare global {
+  // Keep the bridge registry on globalThis so different route modules can resolve the same request.
+  var __atomsPendingBridgeRequests: Map<string, PendingBridgeRequest> | undefined;
+}
+
+const pendingBridgeRequests = globalThis.__atomsPendingBridgeRequests ?? new Map<string, PendingBridgeRequest>();
+
+if (!globalThis.__atomsPendingBridgeRequests) {
+  globalThis.__atomsPendingBridgeRequests = pendingBridgeRequests;
+}
 
 const BRIDGE_TIMEOUT_MS = 90_000;
 

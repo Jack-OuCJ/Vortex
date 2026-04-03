@@ -898,7 +898,7 @@ export function WorkbenchContent() {
               if (data.eventType === "webcontainer_request") {
                 void executeWebContainerRequest(data.request)
                   .then(async (result) => {
-                    await fetch("/api/webcontainer-bridge", {
+                    const response = await fetch("/api/webcontainer-bridge", {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({
@@ -906,9 +906,17 @@ export function WorkbenchContent() {
                         result,
                       }),
                     });
+
+                    if (!response.ok) {
+                      throw new Error(`Bridge callback failed with status ${response.status}`);
+                    }
                   })
-                  .catch(() => {
-                    // 后端会通过 tool_error 事件回传失败状态。
+                  .catch((error) => {
+                    console.error("Failed to deliver WebContainer bridge result", {
+                      requestId: data.request.requestId,
+                      toolName: data.request.toolName,
+                      error,
+                    });
                   });
 
                 continue;
