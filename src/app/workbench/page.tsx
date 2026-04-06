@@ -306,9 +306,29 @@ export function WorkbenchContent() {
             cwd: input.cwd,
             waitForExit: input.waitForExit === true,
           });
+
+          const commandLabel = `${input.command} ${(input.args ?? []).join(" ")}`.trim();
+
+          if (
+            input.waitForExit === true
+            && snapshot.exitCode !== null
+            && snapshot.exitCode !== 0
+          ) {
+            const output = snapshot.output.trim();
+            const outputPreview = output.length > 1200 ? output.slice(-1200) : output;
+
+            return {
+              ok: false,
+              error: `命令执行失败（exitCode=${snapshot.exitCode}）: ${commandLabel}`,
+              detail: outputPreview
+                ? `${commandLabel}\nexitCode=${snapshot.exitCode}\n${outputPreview}`
+                : `${commandLabel}\nexitCode=${snapshot.exitCode}`,
+            };
+          }
+
           return {
             ok: true,
-            detail: `${input.command} ${(input.args ?? []).join(" ")}`.trim(),
+            detail: commandLabel,
             data: snapshot,
           };
         }

@@ -20,6 +20,17 @@ import {
 } from "@/lib/webcontainer-bridge";
 import { canonicalizeLogicalPath, getLegacyLogicalAliases } from "@/lib/webcontainer-template";
 import { formatWorkflowToolTitle, type WorkflowStep } from "@/lib/workflow";
+import { estimateTokens } from "@/lib/context-tokens";
+import { compactIfNeeded } from "@/lib/context-compact";
+import { formatBridgeToolResultForLoop } from "@/lib/tool-result-formatter";
+import {
+  allToolNames,
+  getTool,
+  isReadTool,
+  validateToolInput,
+} from "@/lib/tools/registry";
+import { loadMemories, formatMemoriesPrompt } from "@/lib/memory";
+import { selectRelevantFiles } from "@/lib/dynamic-context";
 
 export const runtime = "nodejs";
 
@@ -156,6 +167,24 @@ type ToolLoopDecision =
       reason?: string;
     }
   | {
+      action: "tool_calls";
+      calls: Array<{
+        tool: WebContainerToolName;
+        input: {
+          path?: string;
+          encoding?: "utf-8";
+          content?: string;
+          recursive?: boolean;
+          command?: string;
+          args?: string[];
+          cwd?: string;
+          waitForExit?: boolean;
+          procId?: string;
+        };
+        reason?: string;
+      }>;
+    }
+  | {
       action: "final";
       files: ProjectFile[];
       deletedPaths?: string[];
@@ -181,6 +210,10 @@ type DebugLogEntry = {
   phase: string;
   round?: number;
   detail?: string;
+  estimatedTokens?: number;
+  llmDurationMs?: number;
+  bridgeDurationMs?: number;
+  modelName?: string;
   payload?: unknown;
 };
 
@@ -815,16 +848,6 @@ const buildFileTreeSummary = (
   return lines.join("\n");
 };
 
-const buildHotFilesContext = (files: ProjectFile[]) => {
-  if (!files.length) {
-    return "当前没有附带热文件全文；如需查看具体内容，请调用 wc.fs.readFile。";
-  }
-
-  return files
-    .map((file) => [`FILE: ${file.path}`, file.code].join("\n"))
-    .join("\n\n");
-};
-
 const BOOTSTRAP_FILE_PATHS = [
   "/package.json",
   "/index.html",
@@ -993,57 +1016,34 @@ const parseToolLoopDecision = (content: string): ToolLoopDecision => {
     const tool = record.tool;
     const input = record.input;
 
-    const allowedTools: WebContainerToolName[] = [
-      "wc.fs.readFile",
-      "wc.fs.writeFile",
-      "wc.fs.readdir",
-      "wc.fs.mkdir",
-      "wc.fs.rm",
-      "wc.spawn",
-      "wc.readProcess",
-      "wc.killProcess",
-    ];
-
-    if (!allowedTools.includes(tool as WebContainerToolName) || !input || typeof input !== "object") {
+    if (!allToolNames.includes(tool as WebContainerToolName) || !input || typeof input !== "object") {
       throw new Error("工具调用参数不合法");
     }
 
-    const inputRecord = input as Record<string, unknown>;
-    const path = typeof inputRecord.path === "string" ? inputRecord.path : undefined;
-    const contentValue = inputRecord.content;
-    const command = typeof inputRecord.command === "string" ? inputRecord.command : undefined;
-    const procId = typeof inputRecord.procId === "string" ? inputRecord.procId : undefined;
+    // Validate using Zod schema from the tool registry
+    const toolName = tool as WebContainerToolName;
+    const validatedInput = validateToolInput(toolName, input);
 
-    if ((tool === "wc.fs.readFile" || tool === "wc.fs.writeFile" || tool === "wc.fs.readdir" || tool === "wc.fs.mkdir" || tool === "wc.fs.rm") && (!path || !path.trim())) {
-      throw new Error(`${tool} 缺少 path`);
-    }
-
-    if (tool === "wc.fs.writeFile" && typeof contentValue !== "string") {
-      throw new Error("wc.fs.writeFile 需要字符串 content");
-    }
-
-    if (tool === "wc.spawn" && !command) {
-      throw new Error("wc.spawn 缺少 command");
-    }
-
-    if ((tool === "wc.readProcess" || tool === "wc.killProcess") && !procId) {
-      throw new Error(`${tool} 缺少 procId`);
-    }
+    // Extract bridge-ready fields (Zod already validated types)
+    const path = typeof validatedInput.path === "string" ? validatedInput.path : undefined;
+    const contentValue = validatedInput.content;
+    const command = typeof validatedInput.command === "string" ? validatedInput.command : undefined;
+    const procId = typeof validatedInput.procId === "string" ? validatedInput.procId : undefined;
 
     return {
       action: "tool_call",
-      tool: tool as WebContainerToolName,
+      tool: toolName,
       input: {
         path,
-        encoding: inputRecord.encoding === "utf-8" ? "utf-8" : undefined,
+        encoding: validatedInput.encoding === "utf-8" ? "utf-8" : undefined,
         content: typeof contentValue === "string" ? contentValue : undefined,
-        recursive: inputRecord.recursive === true,
+        recursive: validatedInput.recursive === true,
         command,
-        args: Array.isArray(inputRecord.args)
-          ? inputRecord.args.filter((arg): arg is string => typeof arg === "string")
+        args: Array.isArray(validatedInput.args)
+          ? validatedInput.args.filter((arg: unknown): arg is string => typeof arg === "string")
           : undefined,
-        cwd: typeof inputRecord.cwd === "string" ? inputRecord.cwd : undefined,
-        waitForExit: inputRecord.waitForExit === true,
+        cwd: typeof validatedInput.cwd === "string" ? validatedInput.cwd : undefined,
+        waitForExit: validatedInput.waitForExit === true,
         procId,
       },
       reason: typeof record.reason === "string" ? record.reason : undefined,
@@ -1108,55 +1108,7 @@ const createBridgeRequestInput = (
   tool: WebContainerToolName,
   input: ToolCallInput
 ): WebContainerToolInputMap[WebContainerToolName] => {
-  switch (tool) {
-    case "wc.fs.readFile":
-      return { path: input.path ?? "", encoding: input.encoding ?? "utf-8" };
-    case "wc.fs.writeFile":
-      return { path: input.path ?? "", content: input.content ?? "" };
-    case "wc.fs.readdir":
-      return { path: input.path ?? "/" };
-    case "wc.fs.mkdir":
-      return { path: input.path ?? "/" };
-    case "wc.fs.rm":
-      return { path: input.path ?? "", recursive: input.recursive === true };
-    case "wc.spawn":
-      return {
-        command: input.command ?? "",
-        args: input.args ?? [],
-        cwd: input.cwd,
-        waitForExit: input.waitForExit === true,
-      };
-    case "wc.readProcess":
-      return { procId: input.procId ?? "" };
-    case "wc.killProcess":
-      return { procId: input.procId ?? "" };
-  }
-};
-
-const formatBridgeToolResult = (
-  tool: WebContainerToolName,
-  result: WebContainerBridgeResult,
-  input: ToolCallInput
-) => {
-  if (!result.ok) {
-    return {
-      ok: false,
-      tool,
-      path: input.path,
-      procId: input.procId,
-      error: result.error,
-      detail: result.detail,
-    };
-  }
-
-  return {
-    ok: true,
-    tool,
-    path: input.path,
-    procId: input.procId,
-    detail: result.detail,
-    data: result.data,
-  };
+  return getTool(tool).toBridgeInput(input as Record<string, unknown>) as WebContainerToolInputMap[WebContainerToolName];
 };
 
 type FileToolLoopParams = {
@@ -1230,6 +1182,8 @@ const runFileToolLoop = async ({
   let interrupted = false;
   let interruptionDetail: string | undefined;
   let consecutiveNoChangeFinals = 0;
+  const loopStartTime = Date.now();
+  const roundSummaries: Array<{ round: number; llmDurationMs?: number; toolCount: number; estimatedTokens?: number }> = [];
 
   await writeDebugLog({
     sessionId: persistCtx.sessionId,
@@ -1245,6 +1199,25 @@ const runFileToolLoop = async ({
   });
 
   for (let round = 1; round <= maxRounds; round += 1) {
+    // Token budget check — apply micro-compact if context is getting too large
+    const totalTokens = estimateTokens(
+      toolLoopMessages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n")
+    );
+    const compactResult = compactIfNeeded(toolLoopMessages);
+    if (compactResult.wasCompacted) {
+      await writeDebugLog({
+        sessionId: persistCtx.sessionId,
+        rootToolCallId,
+        phase: "micro-compact",
+        round,
+        detail: `微压缩释放了 ${compactResult.tokensFreed} tokens`,
+        payload: {
+          beforeTokens: totalTokens,
+          tokensFreed: compactResult.tokensFreed,
+        },
+      });
+    }
+
     await writeDebugLog({
       sessionId: persistCtx.sessionId,
       rootToolCallId,
@@ -1253,6 +1226,7 @@ const runFileToolLoop = async ({
       detail: `工具闭环第 ${round} 轮`,
       payload: {
         knownProcIds: Array.from(knownProcIds),
+        estimatedTokens: totalTokens,
       },
     });
 
@@ -1264,9 +1238,13 @@ const runFileToolLoop = async ({
       detail: `工具闭环第 ${round} 轮`,
     });
 
+    const llmStart = Date.now();
+    let llmDurationMs: number | undefined;
+    let toolsThisRound = 0;
+
     let loopText: string;
     try {
-      loopText = await invokeWithStream(
+      loopText = await invokeWithRetry(
         llm,
         toolLoopMessages,
         agentType,
@@ -1278,8 +1256,14 @@ const runFileToolLoop = async ({
         {
           callId: rootToolCallId,
           toolName: rootToolName,
+        },
+        {
+          sessionId: persistCtx.sessionId,
+          rootToolCallId,
+          round,
         }
       );
+      llmDurationMs = Date.now() - llmStart;
     } catch (error) {
       interrupted = true;
       interruptionDetail = error instanceof Error ? error.message : "工具闭环流式输出失败";
@@ -1353,6 +1337,7 @@ const runFileToolLoop = async ({
       });
 
       if (round < maxRounds) {
+        roundSummaries.push({ round, llmDurationMs, toolCount: toolsThisRound, estimatedTokens: totalTokens });
         toolLoopMessages.push(
           new HumanMessage(
             `上一轮输出无法解析为合法 JSON，原因：${error instanceof Error ? error.message : "解析失败"}。请重新输出一个严格 JSON 对象——要么是工具调用，要么是最终 final，不要添加任何说明或 Markdown 包装。`
@@ -1361,9 +1346,11 @@ const runFileToolLoop = async ({
         continue;
       }
 
+      roundSummaries.push({ round, llmDurationMs, toolCount: toolsThisRound, estimatedTokens: totalTokens });
       break;
     }
 
+    toolsThisRound += 1;
     toolLoopMessages.push(new SystemMessage(`上一轮输出:\n${loopText}`));
 
     if (decision.action === "final") {
@@ -1453,6 +1440,125 @@ const runFileToolLoop = async ({
       break;
     }
 
+    // Handle batch tool_calls (action: "tool_calls")
+    if (decision.action === "tool_calls") {
+      const readCalls = decision.calls.filter((c) => isReadTool(c.tool));
+      const writeCalls = decision.calls.filter((c) => !isReadTool(c.tool));
+
+      // Execute read-only calls in parallel
+      const readPromises = readCalls.map(async (call) => {
+        const readCallId = createToolCallId(call.tool);
+        sendTrackedEvent({
+          eventType: "tool",
+          callId: readCallId,
+          action: "tool_start",
+          toolName: call.tool,
+          detail: call.reason ?? `调用 ${call.tool}`,
+        });
+
+        const bridge = createWebContainerBridgeRequest(
+          call.tool,
+          createBridgeRequestInput(call.tool, call.input) as WebContainerToolInputMap[typeof call.tool]
+        );
+
+        try {
+          const bridgeResult = await bridge.resultPromise;
+          const fmtResult = formatBridgeToolResultForLoop(call.tool, bridgeResult, call.input);
+          sendTrackedEvent({
+            eventType: "tool",
+            callId: readCallId,
+            action: bridgeResult.ok ? "tool_result" : "tool_error",
+            toolName: call.tool,
+            detail: bridgeResult.detail ?? `${call.tool} 执行成功`,
+          });
+          return { tool: call.tool, ok: bridgeResult.ok, formatted: JSON.stringify(fmtResult.formatted) };
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "WebContainer bridge 调用失败";
+          sendTrackedEvent({
+            eventType: "tool",
+            callId: readCallId,
+            action: "tool_error",
+            toolName: call.tool,
+            detail: errorMsg,
+          });
+          return { tool: call.tool, ok: false, formatted: JSON.stringify({ ok: false, error: errorMsg }) };
+        }
+      });
+
+      // Await all parallel reads
+      const parallelResults = await Promise.all(readPromises);
+
+      // Execute write calls sequentially
+      const writeResults: Array<{ tool: WebContainerToolName; ok: boolean; formatted: string }> = [];
+      for (const call of writeCalls) {
+        const writeCallId = createToolCallId(call.tool);
+        sendTrackedEvent({
+          eventType: "tool",
+          callId: writeCallId,
+          action: "tool_start",
+          toolName: call.tool,
+          detail: call.reason ?? `调用 ${call.tool}`,
+        });
+
+        const bridge = createWebContainerBridgeRequest(
+          call.tool,
+          createBridgeRequestInput(call.tool, call.input) as WebContainerToolInputMap[typeof call.tool]
+        );
+
+        try {
+          const bridgeResult = await bridge.resultPromise;
+          const fmtResult = formatBridgeToolResultForLoop(call.tool, bridgeResult, call.input);
+
+          // Update fileMap for writes
+          if (call.tool === "wc.fs.writeFile" && call.input.path) {
+            fileMap.set(call.input.path, call.input.content ?? "");
+          }
+          if (call.tool === "wc.fs.rm" && call.input.path) {
+            fileMap.delete(call.input.path);
+            for (const existingPath of Array.from(fileMap.keys())) {
+              if (existingPath.startsWith(`${call.input.path}/`)) {
+                fileMap.delete(existingPath);
+              }
+            }
+          }
+
+          sendTrackedEvent({
+            eventType: "tool",
+            callId: writeCallId,
+            action: bridgeResult.ok ? "tool_result" : "tool_error",
+            toolName: call.tool,
+            detail: bridgeResult.detail ?? `${call.tool} 执行成功`,
+          });
+          writeResults.push({ tool: call.tool, ok: bridgeResult.ok, formatted: JSON.stringify(fmtResult.formatted) });
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "WebContainer bridge 调用失败";
+          sendTrackedEvent({
+            eventType: "tool",
+            callId: writeCallId,
+            action: "tool_error",
+            toolName: call.tool,
+            detail: errorMsg,
+          });
+          writeResults.push({ tool: call.tool, ok: false, formatted: JSON.stringify({ ok: false, error: errorMsg }) });
+        }
+      }
+
+      // Push all results into messages
+      const allResultLines: string[] = [];
+      for (const r of parallelResults) {
+        allResultLines.push(`工具结果(${r.tool}): ${r.formatted}`);
+      }
+      for (const r of writeResults) {
+        allResultLines.push(`工具结果(${r.tool}): ${r.formatted}`);
+      }
+
+      toolLoopMessages.push(
+        new SystemMessage(`上一轮批量工具调用:\n${allResultLines.join("\n")}`)
+      );
+      continue;
+    }
+
+    // Handle single tool_call (action: "tool_call")
     if (
       (decision.tool === "wc.readProcess" || decision.tool === "wc.killProcess") &&
       decision.input.procId &&
@@ -1605,7 +1711,7 @@ const runFileToolLoop = async ({
     toolLoopMessages.push(
       new HumanMessage(
         `工具结果(${decision.tool}): ${JSON.stringify(
-          formatBridgeToolResult(decision.tool, bridgeResult, decision.input)
+          formatBridgeToolResultForLoop(decision.tool, bridgeResult, decision.input).formatted
         )}`
       )
     );
@@ -1616,6 +1722,8 @@ const runFileToolLoop = async ({
     projectFilesResult = fallbackFiles.length ? fallbackFiles : initialFiles;
   }
 
+  const totalDurationMs = Date.now() - loopStartTime;
+
   await writeDebugLog({
     sessionId: persistCtx.sessionId,
     rootToolCallId,
@@ -1624,6 +1732,10 @@ const runFileToolLoop = async ({
       finalized,
       summary,
       resultFileCount: projectFilesResult.length,
+      totalRounds: maxRounds,
+      totalDurationMs,
+      roundSummaries,
+      fileChanges: Array.from(fileMap.keys()),
     },
   });
 
@@ -1697,6 +1809,61 @@ const invokeWithStream = async (
     }
   }
   return cleanThinkTags(fullContent);
+};
+
+const MAX_STREAM_RETRIES = 2;
+const STREAM_RETRY_BACKOFF_MS = [1000, 2000] as const;
+
+/**
+ * Invoke LLM streaming with retry + backoff.
+ * Inspired by Claude Code's recoverable error handling.
+ */
+const invokeWithRetry = async (
+  llm: ChatOpenAI,
+  messages: Array<HumanMessage | SystemMessage>,
+  agentType: "engineer",
+  agentName: string,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+  persistCtx: PersistContext,
+  agentMessageIds: Map<string, string>,
+  toolContext?: { callId: string; toolName: ToolEvent["toolName"] },
+  debug?: { sessionId: string | null; rootToolCallId: string; round: number }
+): Promise<string> => {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= MAX_STREAM_RETRIES; attempt++) {
+    try {
+      if (attempt > 0) {
+        const backoffMs = STREAM_RETRY_BACKOFF_MS[Math.min(attempt - 1, STREAM_RETRY_BACKOFF_MS.length - 1)];
+        await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+        await writeDebugLog({
+          sessionId: persistCtx.sessionId,
+          rootToolCallId: toolContext?.callId ?? "",
+          phase: "llm-retry",
+          round: debug?.round ?? 0,
+          detail: `第 ${attempt} 次重试（退避 ${backoffMs}ms）`,
+        });
+      }
+      return await invokeWithStream(
+        llm,
+        messages,
+        agentType,
+        agentName,
+        controller,
+        encoder,
+        persistCtx,
+        agentMessageIds,
+        toolContext
+      );
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      // Don't retry timeout errors — they're likely systemic
+      if (lastError.message.includes("超时")) throw lastError;
+    }
+  }
+
+  throw lastError;
 };
 
 export async function POST(req: Request) {
@@ -1773,7 +1940,6 @@ export async function POST(req: Request) {
           const effectiveHotFiles = hotFiles.length ? hotFiles : legacyProjectFiles;
           const projectFiles = mergeProjectFiles(baseProjectFiles, effectiveHotFiles);
           const fileTreeSummary = buildFileTreeSummary(fileTree, projectFiles);
-          const hotFilesContext = buildHotFilesContext(effectiveHotFiles);
           const bootstrapFilesContext = buildBootstrapFilesContext(projectFiles);
           let activeSessionId: string | null = sessionId ?? null;
           const agentMessageIds = new Map<string, string>();
@@ -1820,6 +1986,10 @@ export async function POST(req: Request) {
             supabase,
             activeSessionId
           );
+
+          // Load cross-session memories for the current user+project
+          const memories = await loadMemories(supabase, activeUserId, projectId ?? "");
+          const memoryPrompt = memories.length > 0 ? formatMemoriesPrompt(memories) : "";
 
           const persistCtx: PersistContext = {
             enabled: Boolean(projectId && activeSessionId),
@@ -1887,6 +2057,7 @@ export async function POST(req: Request) {
 
             const hasExistingFiles = projectFiles.length > 0;
             const routeContextBlock = [
+              memoryPrompt || "",
               recentConversationSummary || "最近没有可用的历史对话。",
               hasExistingFiles
                 ? `当前项目已有 ${projectFiles.length} 个文件。`
@@ -2032,7 +2203,20 @@ export async function POST(req: Request) {
                 : "我先整理任务并更新 todo，然后开始改代码。",
           }, persistCtx, agentMessageIds);
 
+          // Build dynamic file context: select top relevant files by intent
+          const hotFilePaths = effectiveHotFiles.map((f) => f.path);
+          const relevantFilesForContext = selectRelevantFiles(
+            projectFiles,
+            routeDecision.intentSummary,
+            hotFilePaths,
+            20,
+          );
+          const dynamicFilesContext = relevantFilesForContext
+            .map((f) => [`FILE: ${f.path}`, f.code].join("\n"))
+            .join("\n\n") || "当前没有可用的相关文件全文。";
+
           const executionTaskInput = [
+            memoryPrompt || "",
             `当前模式: ${routeDecision.mode}`,
             `本轮目标: ${routeDecision.intentSummary}`,
             routeDecision.executionBrief
@@ -2041,8 +2225,7 @@ export async function POST(req: Request) {
             errorMessage ? `错误信息:\n${errorMessage}` : "",
             recentConversationSummary,
             `当前项目文件树:\n${fileTreeSummary}`,
-            `预置关键文件全文:\n${bootstrapFilesContext}`,
-            `热文件全文:\n${hotFilesContext}`,
+            `相关文件全文:\n${dynamicFilesContext}`,
             attachmentsContext || "",
             "要求：先创建或更新根目录 /todo.md，再进行代码修改；所有业务代码统一放在 /src 下；任务完成后用中文输出面向用户的完成报告；final 中只输出真实变更文件和 deletedPaths。",
           ]
